@@ -184,7 +184,9 @@ class Api::V1::Accounts::ConversationsController < Api::V1::Accounts::BaseContro
   end
 
   def conversation
-    @conversation ||= Current.account.conversations.find_by!(display_id: params[:id])
+    @conversation ||= Current.account.conversations.includes(
+      :taggings, :inbox, { assignee: { avatar_attachment: [:blob] } }, { contact: { avatar_attachment: [:blob] } }, :team, :contact_inbox
+    ).find_by!(display_id: params[:id])
     authorize @conversation, :show?
   end
 

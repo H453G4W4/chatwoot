@@ -68,6 +68,51 @@ RSpec.describe 'Conversations API', type: :request do
         expect(body[:data][:meta][:all_count]).to eq(2)
         expect(body[:data][:payload].count).to eq(2)
       end
+
+      it 'returns only conversations waiting for a reply when needs_reply is true' do
+        answered = create(:conversation, account: account, inbox: conversation.inbox)
+        answered.update!(waiting_since: nil)
+
+        get "/api/v1/accounts/#{account.id}/conversations",
+            headers: agent.create_new_auth_token,
+            params: { needs_reply: true },
+            as: :json
+
+        expect(response).to have_http_status(:success)
+        body = JSON.parse(response.body, symbolize_names: true)
+        ids = body[:data][:payload].pluck(:id)
+        expect(ids).to include(conversation.display_id)
+        expect(ids).not_to include(answered.display_id)
+      end
+
+      it 'exposes needs_reply_count in the index meta' do
+        answered = create(:conversation, account: account, inbox: conversation.inbox)
+        answered.update!(waiting_since: nil)
+
+        get "/api/v1/accounts/#{account.id}/conversations",
+            headers: agent.create_new_auth_token,
+            as: :json
+
+        body = JSON.parse(response.body, symbolize_names: true)
+        expect(body[:data][:meta].keys).to include(:needs_reply_count)
+        expect(body[:data][:meta][:all_count]).to eq(2)
+        expect(body[:data][:meta][:needs_reply_count]).to eq(1)
+      end
+
+      it 'returns identical counts whether or not needs_reply is passed' do
+        create(:conversation, account: account, inbox: conversation.inbox)
+
+        get "/api/v1/accounts/#{account.id}/conversations", headers: agent.create_new_auth_token, as: :json
+        without_filter = JSON.parse(response.body, symbolize_names: true)[:data][:meta]
+
+        get "/api/v1/accounts/#{account.id}/conversations",
+            headers: agent.create_new_auth_token,
+            params: { needs_reply: true },
+            as: :json
+        with_filter = JSON.parse(response.body, symbolize_names: true)[:data][:meta]
+
+        expect(with_filter).to eq(without_filter)
+      end
     end
   end
 
@@ -97,6 +142,30 @@ RSpec.describe 'Conversations API', type: :request do
         body = JSON.parse(response.body, symbolize_names: true)
         expect(body[:meta].keys).to include(:all_count, :mine_count, :assigned_count, :unassigned_count)
         expect(body[:meta][:all_count]).to eq(1)
+      end
+
+      it 'exposes needs_reply_count' do
+        get "/api/v1/accounts/#{account.id}/conversations/meta",
+            headers: agent.create_new_auth_token,
+            as: :json
+
+        expect(response).to have_http_status(:success)
+        body = JSON.parse(response.body, symbolize_names: true)
+        expect(body[:meta].keys).to include(:needs_reply_count)
+        expect(body[:meta][:needs_reply_count]).to eq(1)
+      end
+
+      it 'returns counts unaffected by the needs_reply parameter' do
+        get "/api/v1/accounts/#{account.id}/conversations/meta", headers: agent.create_new_auth_token, as: :json
+        without_filter = JSON.parse(response.body, symbolize_names: true)[:meta]
+
+        get "/api/v1/accounts/#{account.id}/conversations/meta",
+            headers: agent.create_new_auth_token,
+            params: { needs_reply: true },
+            as: :json
+        with_filter = JSON.parse(response.body, symbolize_names: true)[:meta]
+
+        expect(with_filter).to eq(without_filter)
       end
     end
   end

@@ -41,39 +41,30 @@ class ConversationFinder
   def perform
     set_up
 
-    mine_count, unassigned_count, all_count = set_count_for_all_conversations
-    assigned_count = all_count - unassigned_count
+    # Counts are computed over the base scope, before assignee and needs_reply filtering,
+    # so they stay identical whichever queue the dashboard is currently showing.
+    counts = conversation_counts
 
     filter_by_assignee_type
+    filter_by_needs_reply
 
-    {
-      conversations: conversations,
-      count: {
-        mine_count: mine_count,
-        assigned_count: assigned_count,
-        unassigned_count: unassigned_count,
-        all_count: all_count
-      }
-    }
+    { conversations: conversations, count: counts }
   end
 
   def perform_meta_only
     set_up
 
-    mine_count, unassigned_count, all_count, = set_count_for_all_conversations
-    assigned_count = all_count - unassigned_count
-
-    {
-      count: {
-        mine_count: mine_count,
-        assigned_count: assigned_count,
-        unassigned_count: unassigned_count,
-        all_count: all_count
-      }
-    }
+    { count: conversation_counts }
   end
 
   private
+
+  def conversation_counts
+    mine_count, unassigned_count, all_count, needs_reply_count = set_count_for_all_conversations
+
+    { mine_count: mine_count, assigned_count: all_count - unassigned_count, unassigned_count: unassigned_count,
+      all_count: all_count, needs_reply_count: needs_reply_count }
+  end
 
   def set_up
     set_inboxes
@@ -136,6 +127,15 @@ class ConversationFinder
     @conversations
   end
 
+  def needs_reply?
+    ActiveModel::Type::Boolean.new.cast(params[:needs_reply])
+  end
+
+  def filter_by_needs_reply
+    @conversations = @conversations.where.not(waiting_since: nil) if needs_reply?
+    @conversations
+  end
+
   def filter_by_conversation_type
     case @params[:conversation_type]
     when 'mention'
@@ -191,16 +191,18 @@ class ConversationFinder
     counts = @conversations.unscope(:order).pick(
       Arel.sql("COUNT(*) FILTER (WHERE assignee_id = #{current_user.id})"),
       Arel.sql('COUNT(*) FILTER (WHERE assignee_id IS NULL AND assignee_agent_bot_id IS NULL)'),
-      Arel.sql('COUNT(*)')
+      Arel.sql('COUNT(*)'),
+      Arel.sql('COUNT(*) FILTER (WHERE waiting_since IS NOT NULL)')
     )
-    counts || [0, 0, 0]
+    counts || [0, 0, 0, 0]
   end
 
   def legacy_count_for_all_conversations
     [
       @conversations.assigned_to(current_user).count,
       @conversations.unassigned.count,
-      @conversations.count
+      @conversations.count,
+      @conversations.where.not(waiting_since: nil).count
     ]
   end
 

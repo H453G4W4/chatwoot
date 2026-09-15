@@ -179,7 +179,8 @@ describe ConversationFinder do
                                        mine_count: 2,
                                        assigned_count: 4,
                                        unassigned_count: 1,
-                                       all_count: 5
+                                       all_count: 5,
+                                       needs_reply_count: 5
                                      })
       end
     end
@@ -274,7 +275,8 @@ describe ConversationFinder do
                                        mine_count: 2,
                                        assigned_count: 3,
                                        unassigned_count: 1,
-                                       all_count: 4
+                                       all_count: 4,
+                                       needs_reply_count: 4
                                      })
       end
 
@@ -327,6 +329,157 @@ describe ConversationFinder do
 
         expect(result[:count][:all_count]).to eq 1
       end
+    end
+  end
+
+  describe '#perform with needs_reply' do
+    let(:params) { { status: 'open', assignee_type: 'all' } }
+    let!(:answered_conversation) { create(:conversation, account: account, inbox: inbox) }
+
+    # waiting_since is stamped unconditionally by Conversation#ensure_waiting_since on create,
+    # so an "answered" row has to have it cleared afterwards.
+    before { answered_conversation.update!(waiting_since: nil) }
+
+    it 'returns only conversations that are waiting for a reply' do
+      result = described_class.new(user_1, params.merge(needs_reply: 'true')).perform
+
+      expect(result[:conversations]).to be_present
+      expect(result[:conversations].map(&:waiting_since)).to all(be_present)
+      expect(result[:conversations].map(&:id)).not_to include(answered_conversation.id)
+    end
+
+    it 'returns conversations regardless of waiting_since when needs_reply is absent' do
+      result = described_class.new(user_1, params).perform
+
+      expect(result[:conversations].map(&:id)).to include(answered_conversation.id)
+    end
+
+    it 'does not filter when needs_reply casts to false' do
+      result = described_class.new(user_1, params.merge(needs_reply: 'false')).perform
+
+      expect(result[:conversations].map(&:id)).to include(answered_conversation.id)
+    end
+
+    it 'reports needs_reply_count over the same base scope as all_count' do
+      result = described_class.new(user_1, params).perform
+
+      expect(result[:count][:all_count]).to eq 5
+      expect(result[:count][:needs_reply_count]).to eq 4
+    end
+
+    it 'returns identical counts with and without the needs_reply param' do
+      filtered = described_class.new(user_1, params.merge(needs_reply: 'true')).perform[:count]
+      unfiltered = described_class.new(user_1, params).perform[:count]
+
+      expect(filtered).to eq(unfiltered)
+      expect(filtered[:needs_reply_count]).to eq 4
+    end
+
+    it 'returns identical meta-only counts with and without the needs_reply param' do
+      filtered = described_class.new(user_1, params.merge(needs_reply: 'true')).perform_meta_only[:count]
+      unfiltered = described_class.new(user_1, params).perform_meta_only[:count]
+
+      expect(filtered).to eq(unfiltered)
+    end
+
+    it 'composes with a selected inbox' do
+      other_inbox = create(:inbox, account: account)
+      create(:inbox_member, user: user_1, inbox: other_inbox)
+      other_waiting = create(:conversation, account: account, inbox: other_inbox)
+
+      result = described_class.new(user_1, params.merge(needs_reply: 'true', inbox_id: other_inbox.id)).perform
+
+      expect(result[:conversations].map(&:id)).to contain_exactly(other_waiting.id)
+    end
+
+    it 'composes with status' do
+      # Resolving is an update, so Conversation#handle_resolved_status_change clears waiting_since.
+      resolved_and_answered = create(:conversation, account: account, inbox: inbox)
+      resolved_and_answered.resolved!
+      still_waiting = create(:conversation, account: account, inbox: inbox, status: 'resolved')
+
+      result = described_class.new(user_1, params.merge(needs_reply: 'true', status: 'resolved')).perform
+
+      expect(result[:conversations].map(&:id)).to include(still_waiting.id)
+      expect(result[:conversations].map(&:id)).not_to include(resolved_and_answered.id)
+    end
+
+    it 'composes with team' do
+      team = create(:team, account: account)
+      team_conversation = create(:conversation, account: account, inbox: inbox, team: team)
+
+      result = described_class.new(user_1, params.merge(needs_reply: 'true', team_id: team.id)).perform
+
+      expect(result[:conversations].map(&:id)).to contain_exactly(team_conversation.id)
+    end
+
+    it 'composes with labels' do
+      labelled = create(:conversation, account: account, inbox: inbox)
+      labelled.update!(label_list: ['billing'])
+
+      result = described_class.new(user_1, params.merge(needs_reply: 'true', labels: ['billing'])).perform
+
+      expect(result[:conversations].map(&:id)).to contain_exactly(labelled.id)
+    end
+
+    it 'composes with conversation_type unattended' do
+      result = described_class.new(user_1, params.merge(needs_reply: 'true', conversation_type: 'unattended')).perform
+
+      expect(result[:conversations].map(&:id)).not_to include(answered_conversation.id)
+      expect(result[:conversations].map(&:waiting_since)).to all(be_present)
+    end
+
+    it 'never widens the permission scope' do
+      restricted_conversation = create(:conversation, account: account, inbox: restricted_inbox)
+
+      result = described_class.new(user_1, params.merge(needs_reply: 'true')).perform
+
+      expect(result[:conversations].map(&:id)).not_to include(restricted_conversation.id)
+      expect(result[:count][:needs_reply_count]).to eq 4
+    end
+
+    it 'paginates the filtered result set' do
+      create_list(:conversation, 30, account: account, inbox: inbox)
+
+      page_1 = described_class.new(user_1, params.merge(needs_reply: 'true', page: 1)).perform
+      page_2 = described_class.new(user_1, params.merge(needs_reply: 'true', page: 2)).perform
+
+      expect(page_1[:conversations].length).to eq 25
+      expect(page_2[:conversations].length).to eq 9
+      expect(page_1[:conversations].map(&:id) & page_2[:conversations].map(&:id)).to be_empty
+    end
+  end
+
+  describe '#perform ordering determinism' do
+    let(:params) { { status: 'open', assignee_type: 'all', sort_by: 'last_activity_at_desc' } }
+
+    it 'breaks last_activity_at ties by id descending' do
+      tied_at = 1.hour.ago.change(usec: 0)
+      tied = create_list(:conversation, 5, account: account, inbox: inbox)
+      # rubocop:disable Rails/SkipsModelValidations
+      Conversation.where(id: tied.map(&:id)).update_all(last_activity_at: tied_at)
+      # rubocop:enable Rails/SkipsModelValidations
+
+      result = described_class.new(user_1, params).perform
+      tied_ids_in_order = result[:conversations].map(&:id) & tied.map(&:id)
+
+      expect(tied_ids_in_order).to eq(tied.map(&:id).sort.reverse)
+    end
+
+    it 'keeps pages disjoint when every row shares the same last_activity_at' do
+      tied_at = 2.hours.ago.change(usec: 0)
+      created = create_list(:conversation, 30, account: account, inbox: inbox)
+      # rubocop:disable Rails/SkipsModelValidations
+      Conversation.where(account_id: account.id).update_all(last_activity_at: tied_at)
+      # rubocop:enable Rails/SkipsModelValidations
+
+      page_1 = described_class.new(user_1, params.merge(page: 1)).perform[:conversations].map(&:id)
+      page_2 = described_class.new(user_1, params.merge(page: 2)).perform[:conversations].map(&:id)
+
+      expect(page_1.length).to eq 25
+      expect(page_1 & page_2).to be_empty
+      expect(page_1 + page_2).to eq((page_1 + page_2).sort.reverse)
+      expect(created.map(&:id) - (page_1 + page_2)).to be_empty
     end
   end
 end

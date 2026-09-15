@@ -868,4 +868,84 @@ RSpec.describe Message do
       end
     end
   end
+
+  context 'when writing conversation activity' do
+    let(:conversation) { create(:conversation) }
+    let(:older) { 30.minutes.ago.change(usec: 0) }
+    let(:newer) { 10.minutes.ago.change(usec: 0) }
+
+    before do
+      # A new conversation defaults last_activity_at to CURRENT_TIMESTAMP, which would dominate
+      # every timestamp used here; start it behind both.
+      # rubocop:disable Rails/SkipsModelValidations
+      conversation.update_columns(last_activity_at: 2.hours.ago.change(usec: 0))
+      # rubocop:enable Rails/SkipsModelValidations
+    end
+
+    it 'does not lower last_activity_at for a provider backdated message' do
+      create(:message, conversation: conversation, account: conversation.account, created_at: newer)
+      established = conversation.reload.last_activity_at
+
+      create(:message, conversation: conversation, account: conversation.account, created_at: older)
+
+      expect(conversation.reload.last_activity_at).to eq established
+      expect(conversation.reload.last_activity_at).to eq newer
+    end
+
+    it 'still advances last_activity_at for a newer message' do
+      create(:message, conversation: conversation, account: conversation.account, created_at: older)
+      create(:message, conversation: conversation, account: conversation.account, created_at: newer)
+
+      expect(conversation.reload.last_activity_at).to eq newer
+    end
+
+    it 'leaves no unpersisted last_activity_at on the in-memory conversation' do
+      message = build(:message, conversation: conversation, account: conversation.account)
+
+      message.save!
+
+      expect(message.conversation.changed).not_to include('last_activity_at')
+      expect(message.conversation.last_activity_at).to eq conversation.reload.last_activity_at
+    end
+
+    it 'does not let the following waiting_since update write a stale activity value' do
+      create(:message, conversation: conversation, account: conversation.account, message_type: :incoming, created_at: newer)
+      established = conversation.reload.last_activity_at
+      expect(conversation.waiting_since).to be_present
+
+      # A backdated outgoing human reply clears waiting_since, so Conversation#update runs right
+      # after the activity write - exactly where a dirty last_activity_at would be persisted back.
+      create(:message, conversation: conversation, account: conversation.account, message_type: :outgoing, created_at: older)
+
+      expect(conversation.reload.waiting_since).to be_nil
+      expect(conversation.reload.last_activity_at).to eq established
+    end
+
+    # Serialized equivalent of the accepted concurrency invariant: the row lock turns overlapping
+    # callbacks into an ordered pair, so assert what is true of that ordering rather than asserting
+    # that the first callback can see a write that has not happened yet.
+    it 'keeps serialized activity writes non-decreasing and ends on the maximum' do
+      first = build(:message, conversation: conversation, account: conversation.account, created_at: newer)
+      second = build(:message, conversation: conversation, account: conversation.account, created_at: older)
+
+      first.save!
+      after_first = conversation.reload.last_activity_at
+      payload_first = first.conversation.last_activity_at
+
+      second.save!
+      after_second = conversation.reload.last_activity_at
+      payload_second = second.conversation.last_activity_at
+
+      # (a) neither locked callback lowers activity
+      expect(after_first).to eq newer
+      expect(after_second).to be >= after_first
+      # (b) each payload carries the value that callback itself established or read under the lock
+      expect(payload_first).to eq after_first
+      expect(payload_second).to eq after_second
+      # (c) activity is non-decreasing across the serialized writes
+      expect([after_first, after_second]).to eq([after_first, after_second].sort)
+      # (d) once both complete the row holds the maximum
+      expect(after_second).to eq [first.created_at, second.created_at].max
+    end
+  end
 end

@@ -447,9 +447,23 @@ class Message < ApplicationRecord
   end
 
   def set_conversation_activity
-    # rubocop:disable Rails/SkipsModelValidations
-    conversation.update_columns(last_activity_at: created_at, updated_at: Time.current)
-    # rubocop:enable Rails/SkipsModelValidations
+    # Activity must never move backwards: `created_at` is provider supplied on some channels
+    # (backdated imports and echoes) and concurrent message callbacks on one conversation can
+    # commit out of order. Lock the conversation row for the read-modify-write so the greatest
+    # value wins, and write through update_columns so the in-memory record that the push payload
+    # is built from matches the row and is left clean for the waiting_since update that follows.
+    #
+    # The row is locked by id rather than through conversation.with_lock: a freshly created
+    # conversation deliberately carries unpersisted display_id/uuid attributes
+    # (Conversation#load_attributes_created_by_db_triggers) and ActiveRecord refuses to lock a
+    # record that has unpersisted changes.
+    conversation.transaction do
+      locked_activity_at = Conversation.lock.where(id: conversation.id).pick(:last_activity_at)
+      latest = [locked_activity_at, created_at].compact.max
+      # rubocop:disable Rails/SkipsModelValidations
+      conversation.update_columns(last_activity_at: latest, updated_at: Time.current)
+      # rubocop:enable Rails/SkipsModelValidations
+    end
   end
 
   def reindex_for_search
