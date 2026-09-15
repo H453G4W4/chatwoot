@@ -61,6 +61,36 @@ describe('#ConversationAPI', () => {
       });
     });
 
+    it('#get sends needs_reply only when the Needs Reply queue is active', () => {
+      conversationAPI.get({ status: 'open', page: 1, needsReply: true });
+      expect(axiosMock.get).toHaveBeenCalledWith(
+        '/api/v1/conversations',
+        expect.objectContaining({
+          params: expect.objectContaining({ needs_reply: true }),
+        })
+      );
+    });
+
+    it('#get omits needs_reply entirely when inactive', () => {
+      conversationAPI.get({ status: 'open', page: 1, needsReply: false });
+      const { params } = axiosMock.get.mock.calls.at(-1)[1];
+      expect(params.needs_reply).toBeUndefined();
+    });
+
+    it('#meta sends needs_reply only when active', () => {
+      conversationAPI.meta({ status: 'open', needsReply: true });
+      expect(axiosMock.get).toHaveBeenCalledWith(
+        '/api/v1/conversations/meta',
+        expect.objectContaining({
+          params: expect.objectContaining({ needs_reply: true }),
+        })
+      );
+
+      conversationAPI.meta({ status: 'open' });
+      const { params } = axiosMock.get.mock.calls.at(-1)[1];
+      expect(params.needs_reply).toBeUndefined();
+    });
+
     it('#search', () => {
       conversationAPI.search({
         q: 'leads',

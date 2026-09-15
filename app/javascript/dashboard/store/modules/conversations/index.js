@@ -18,6 +18,13 @@ import { CONTENT_TYPES } from 'dashboard/components-next/message/constants.js';
 const state = {
   allConversations: [],
   attachments: {},
+  // Guards REST list/page requests only. It is bumped on every list reset so a page response
+  // that was already in flight cannot overwrite the list the user actually asked for. It is
+  // never consulted by the realtime fetch lifecycle, which has its own generation.
+  listGeneration: 0,
+  // Ids the finder returned for the mention / participating views. Used only to decide what
+  // those views RENDER - never to gate insertion into the store.
+  viewMembership: { mention: new Set(), participating: new Set() },
   listLoadingStatus: true,
   chatStatusFilter: wootConstants.STATUS_TYPE.OPEN,
   chatSortFilter: wootConstants.SORT_BY_TYPE.LATEST,
@@ -61,6 +68,17 @@ export const mutations = {
   [types.EMPTY_ALL_CONVERSATION](_state) {
     _state.allConversations = [];
     _state.selectedChatId = null;
+    // Invalidates any list request already in flight. Realtime state is deliberately NOT reset
+    // here - it is owned by account/logout/teardown lifecycle code, so switching a queue can
+    // never lose a customer message.
+    _state.listGeneration += 1;
+    _state.viewMembership = { mention: new Set(), participating: new Set() };
+  },
+
+  [types.SET_CONVERSATION_VIEW_MEMBERSHIP](_state, { view, ids }) {
+    const members = new Set(_state.viewMembership[view]);
+    ids.forEach(id => members.add(id));
+    _state.viewMembership = { ..._state.viewMembership, [view]: members };
   },
   [types.SET_ALL_MESSAGES_LOADED](_state, conversationId) {
     const chat = getConversationById(_state)(conversationId);

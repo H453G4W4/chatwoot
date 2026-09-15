@@ -31,8 +31,6 @@ import {
 import { useEmitter } from 'dashboard/composables/emitter';
 import { useConversationRequiredAttributes } from 'dashboard/composables/useConversationRequiredAttributes';
 
-import { emitter } from 'shared/helpers/mitt';
-
 import wootConstants from 'dashboard/constants/globals';
 import advancedFilterOptions from './widgets/conversation/advancedFilterItems';
 import filterQueryGenerator from '../helper/filterQueryGenerator.js';
@@ -45,13 +43,9 @@ import {
   isOnParticipatingView,
   isOnUnattendedView,
 } from '../store/modules/conversations/helpers/actionHelpers';
-import {
-  getUserPermissions,
-  filterItemsByPermission,
-} from 'dashboard/helper/permissionsHelper.js';
 import { matchesFilters } from '../store/modules/conversations/helpers/filterHelpers';
+import { compareByLastActivityDesc } from '../store/modules/conversations/helpers';
 import { CONVERSATION_EVENTS } from '../helper/AnalyticsHelper/events';
-import { ASSIGNEE_TYPE_TAB_PERMISSIONS } from 'dashboard/constants/permissions.js';
 
 const props = defineProps({
   conversationInbox: { type: [String, Number], default: 0 },
@@ -64,7 +58,7 @@ const props = defineProps({
 });
 
 const emit = defineEmits(['conversationLoad']);
-const { uiSettings } = useUISettings();
+const { uiSettings, updateUISettings } = useUISettings();
 const { t } = useI18n();
 const router = useRouter();
 const route = useRoute();
@@ -72,9 +66,10 @@ const store = useStore();
 
 const resolveAttributesModalRef = ref(null);
 
-const activeAssigneeTab = ref(wootConstants.ASSIGNEE_TYPE.ALL);
 const activeStatus = ref(wootConstants.STATUS_TYPE.OPEN);
-const activeSortBy = ref(wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC);
+// All | Needs Reply. Persisted at the TOP level of uiSettings, because the status dropdown
+// replaces the whole conversations_filter_by object and would otherwise wipe it.
+const needsReply = ref(false);
 const showAdvancedFilters = ref(false);
 // chatsOnView is to store the chats that are currently visible on the screen,
 // which mirrors the conversationList.
@@ -92,9 +87,7 @@ const advancedFilterTypes = ref(
 
 const currentUser = useMapGetter('getCurrentUser');
 const chatLists = useMapGetter('getFilteredConversations');
-const mineChatsList = useMapGetter('getMineChats');
 const allChatList = useMapGetter('getAllStatusChats');
-const unAssignedChatsList = useMapGetter('getUnAssignedChats');
 const participatingChatsList = useMapGetter('getParticipatingChats');
 const chatListLoading = useMapGetter('getChatListLoadingStatus');
 const activeInbox = useMapGetter('getSelectedInbox');
@@ -106,7 +99,6 @@ const teamsList = useMapGetter('teams/getTeams');
 const inboxesList = useMapGetter('inboxes/getInboxes');
 const campaigns = useMapGetter('campaigns/getAllCampaigns');
 const labels = useMapGetter('labels/getLabels');
-const currentAccountId = useMapGetter('getCurrentAccountId');
 // We can't useFunctionGetter here since it needs to be called on setup?
 const getTeamFn = useMapGetter('teams/getTeam');
 const getConversationById = useMapGetter('getConversationById');
@@ -171,41 +163,44 @@ const currentUserDetails = computed(() => {
   return { id, name };
 });
 
-const userPermissions = computed(() => {
-  return getUserPermissions(currentUser.value, currentAccountId.value);
-});
+// The quick filter is a queue switch, not a saved query. Folder and advanced-filter routes go
+// to a different endpoint, so the control is hidden there and needs_reply is never sent.
+const quickFilterAvailable = computed(
+  () => !hasAppliedFiltersOrActiveFolders.value
+);
 
-const assigneeTabItems = computed(() => {
-  return filterItemsByPermission(
-    ASSIGNEE_TYPE_TAB_PERMISSIONS,
-    userPermissions.value,
-    item => item.permissions
-  ).map(({ key, count: countKey }) => ({
-    key,
-    name: t(`CHAT_LIST.ASSIGNEE_TYPE_TABS.${key}`),
-    count: conversationStats.value[countKey] || 0,
-  }));
-});
+const effectiveNeedsReply = computed(
+  () => quickFilterAvailable.value && needsReply.value
+);
 
-const showAssigneeInConversationCard = computed(() => {
-  return (
-    hasAppliedFiltersOrActiveFolders.value ||
-    activeAssigneeTab.value === wootConstants.ASSIGNEE_TYPE.ALL
-  );
-});
+const activeQueueTab = computed(() =>
+  effectiveNeedsReply.value ? 'needsReply' : 'all'
+);
+
+const queueTabItems = computed(() => [
+  {
+    key: 'all',
+    name: t('CHAT_LIST.QUEUE_TABS.ALL'),
+    count: conversationStats.value.allCount || 0,
+  },
+  {
+    key: 'needsReply',
+    name: t('CHAT_LIST.QUEUE_TABS.NEEDS_REPLY'),
+    count: conversationStats.value.needsReplyCount || 0,
+  },
+]);
+
+// Every row is shown with its assignee: assignment is metadata in a global queue, it never
+// controls visibility.
+const showAssigneeInConversationCard = computed(() => true);
 
 const currentPageFilterKey = computed(() => {
-  return hasAppliedFiltersOrActiveFolders.value
-    ? 'appliedFilters'
-    : activeAssigneeTab.value;
+  if (hasAppliedFiltersOrActiveFolders.value) return 'appliedFilters';
+  return effectiveNeedsReply.value ? 'needsReply' : 'all';
 });
 
 const inbox = useFunctionGetter('inboxes/getInbox', activeInbox);
 const currentPage = useFunctionGetter(
-  'conversationPage/getCurrentPageFilter',
-  activeAssigneeTab
-);
-const currentFiltersPage = useFunctionGetter(
   'conversationPage/getCurrentPageFilter',
   currentPageFilterKey
 );
@@ -219,12 +214,12 @@ const conversationCustomAttributes = useFunctionGetter(
   'conversation_attribute'
 );
 
-const activeAssigneeTabCount = computed(() => {
-  const count = assigneeTabItems.value.find(
-    item => item.key === activeAssigneeTab.value
-  ).count;
-  return count;
-});
+// Total for the queue currently on screen, used by the page-1 refill heuristic below.
+const activeListCount = computed(() =>
+  effectiveNeedsReply.value
+    ? (conversationStats.value.needsReplyCount ?? 0)
+    : (conversationStats.value.allCount ?? 0)
+);
 
 const conversationListPagination = computed(() => {
   const conversationsPerPage = 25;
@@ -236,8 +231,8 @@ const conversationListPagination = computed(() => {
     !hasAppliedFiltersOrActiveFolders.value && hasChatsOnView;
   const isUnderPerPage =
     chatsOnView.value.length < conversationsPerPage &&
-    activeAssigneeTabCount.value < conversationsPerPage &&
-    activeAssigneeTabCount.value > chatsOnView.value.length;
+    activeListCount.value < conversationsPerPage &&
+    activeListCount.value > chatsOnView.value.length;
 
   if (isNoFiltersOrFoldersAndChatListNotEmpty && isUnderPerPage) {
     return 1;
@@ -256,6 +251,7 @@ const conversationFilters = computed(() => {
     labels: props.label ? [props.label] : undefined,
     teamId: props.teamId || undefined,
     conversationType: props.conversationType || undefined,
+    needsReply: effectiveNeedsReply.value,
   };
 });
 
@@ -296,27 +292,6 @@ const pageTitle = computed(() => {
   return t('CHAT_LIST.TAB_HEADING');
 });
 
-function filterByAssigneeTab(conversations) {
-  if (activeAssigneeTab.value === wootConstants.ASSIGNEE_TYPE.ME) {
-    return conversations.filter(
-      c => c.meta?.assignee?.id === currentUser.value?.id
-    );
-  }
-  if (activeAssigneeTab.value === wootConstants.ASSIGNEE_TYPE.UNASSIGNED) {
-    return conversations.filter(c => !c.meta?.assignee);
-  }
-  return [...conversations];
-}
-
-function sortByUnreadStatus(conversations) {
-  return [...conversations].sort((a, b) => {
-    const unreadCountDiff = (b.unread_count || 0) - (a.unread_count || 0);
-    if (unreadCountDiff !== 0) return unreadCountDiff;
-
-    return (b.last_activity_at || 0) - (a.last_activity_at || 0);
-  });
-}
-
 const conversationList = computed(() => {
   let localConversationList = [];
 
@@ -325,13 +300,7 @@ const conversationList = computed(() => {
     if (
       props.conversationType === wootConstants.CONVERSATION_TYPE.PARTICIPATING
     ) {
-      localConversationList = filterByAssigneeTab(
-        participatingChatsList.value(filters)
-      );
-    } else if (activeAssigneeTab.value === 'me') {
-      localConversationList = [...mineChatsList.value(filters)];
-    } else if (activeAssigneeTab.value === 'unassigned') {
-      localConversationList = [...unAssignedChatsList.value(filters)];
+      localConversationList = [...participatingChatsList.value(filters)];
     } else {
       localConversationList = [...allChatList.value(filters)];
     }
@@ -346,16 +315,9 @@ const conversationList = computed(() => {
     });
   }
 
-  if (
-    !hasAppliedFiltersOrActiveFolders.value &&
-    activeSortBy.value === wootConstants.SORT_BY_TYPE.UNREAD
-  ) {
-    localConversationList = sortByUnreadStatus(localConversationList);
-  }
-
-  return [...localConversationList].sort(
-    (a, b) => (b.last_activity_at || 0) - (a.last_activity_at || 0)
-  );
+  // One comparator for the whole queue: last_activity_at DESC, id DESC. Priority never
+  // participates, and the source array is never mutated.
+  return [...localConversationList].sort(compareByLastActivityDesc);
 });
 
 const showEndOfListMessage = computed(() => {
@@ -384,7 +346,8 @@ function setFiltersFromUISettings() {
   const { conversations_filter_by: filterBy = {} } = uiSettings.value;
   const { status } = filterBy;
   activeStatus.value = status || wootConstants.STATUS_TYPE.OPEN;
-  activeSortBy.value = wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC;
+  // Top-level key: the status dropdown rewrites conversations_filter_by wholesale.
+  needsReply.value = Boolean(uiSettings.value.conversations_needs_reply);
 }
 
 function emitConversationLoaded() {
@@ -393,7 +356,7 @@ function emitConversationLoaded() {
 
 function fetchFilteredConversations(payload) {
   payload = useSnakeCase(payload);
-  let page = currentFiltersPage.value + 1;
+  let page = currentPage.value + 1;
   store
     .dispatch('fetchFilteredConversations', {
       queryData: filterQueryGenerator(payload),
@@ -409,7 +372,7 @@ function fetchFilteredConversations(payload) {
 
 function fetchSavedFilteredConversations(payload) {
   payload = useSnakeCase(payload);
-  let page = currentFiltersPage.value + 1;
+  let page = currentPage.value + 1;
   store
     .dispatch('fetchFilteredConversations', {
       queryData: payload,
@@ -492,10 +455,11 @@ function setParamsForEditFolderModal() {
 }
 
 function initializeExistingFilterToModal() {
+  // The queue is always assignee_type=all, so only the status prefill applies here.
   const statusFilter = initializeStatusAndAssigneeFilterToModal(
     activeStatus.value,
     currentUserDetails.value,
-    activeAssigneeTab.value
+    wootConstants.ASSIGNEE_TYPE.ALL
   );
   // TODO: Remove the usage of useCamelCase after migrating useFilter to camelcase
   if (statusFilter) {
@@ -605,22 +569,18 @@ function loadMoreConversations() {
   }
 }
 
-function updateAssigneeTab(selectedTab) {
-  if (activeAssigneeTab.value !== selectedTab) {
-    resetBulkActions();
-    emitter.emit('clearSearchInput');
-    activeAssigneeTab.value = selectedTab;
-    if (!currentPage.value) {
-      fetchConversations();
-    }
-  }
+function onQueueTabChange(selectedTab) {
+  const nextNeedsReply = selectedTab === 'needsReply';
+  if (needsReply.value === nextNeedsReply) return;
+  resetBulkActions();
+  needsReply.value = nextNeedsReply;
+  updateUISettings({ conversations_needs_reply: nextNeedsReply });
+  resetAndFetchData();
 }
 
 function onBasicFilterChange(value, type) {
   if (type === 'status') {
     activeStatus.value = value;
-  } else {
-    activeSortBy.value = wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC;
   }
   resetAndFetchData();
 }
@@ -811,7 +771,10 @@ onMounted(() => {
   store.dispatch('setChatListFilters', conversationFilters.value);
   setFiltersFromUISettings();
   store.dispatch('setChatStatusFilter', activeStatus.value);
-  store.dispatch('setChatSortFilter', activeSortBy.value);
+  store.dispatch(
+    'setChatSortFilter',
+    wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC
+  );
   resetAndFetchData();
   if (hasActiveFolders.value) {
     store.dispatch('campaigns/get');
@@ -930,11 +893,11 @@ watch(conversationFilters, (newVal, oldVal) => {
     />
 
     <ChatTypeTabs
-      v-if="false"
-      :items="assigneeTabItems"
-      :active-tab="activeAssigneeTab"
+      v-if="quickFilterAvailable"
+      :items="queueTabItems"
+      :active-tab="activeQueueTab"
       is-compact
-      @chat-tab-change="updateAssigneeTab"
+      @chat-tab-change="onQueueTabChange"
     />
 
     <p

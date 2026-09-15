@@ -15,6 +15,10 @@
       "INPUT": "Search for People, Chats, Saved Replies .."
     },
     "FILTER_ALL": "All",
+    "QUEUE_TABS": {
+      "ALL": "All",
+      "NEEDS_REPLY": "Needs Reply"
+    },
     "ASSIGNEE_TYPE_TABS": {
       "me": "Mine",
       "unassigned": "Unassigned",

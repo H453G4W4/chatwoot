@@ -11,6 +11,9 @@ import {
   isNewerMessage,
   mergeMessagesById,
   mergeConversation,
+  isWaitingForReply,
+  filterByNeedsReply,
+  filterByViewMembership,
 } from '../../conversations/helpers';
 
 const conversationList = [
@@ -376,5 +379,75 @@ describe('#mergeConversation', () => {
     expect(merged.messages).toHaveLength(7);
     expect(merged.allMessagesLoaded).toBe(true);
     expect(merged.dataFetched).toBe(true);
+  });
+});
+
+describe('#isWaitingForReply / #filterByNeedsReply', () => {
+  it('treats waiting_since 0 as nil, never a null check', () => {
+    expect(isWaitingForReply({ waiting_since: 0 })).toBe(false);
+    expect(isWaitingForReply({ waiting_since: 1712345678 })).toBe(true);
+    expect(isWaitingForReply({})).toBe(false);
+  });
+
+  it('keeps every conversation when Needs Reply is inactive', () => {
+    expect(filterByNeedsReply(true, false, { waiting_since: 0 })).toBe(true);
+  });
+
+  it('keeps only waiting conversations when active', () => {
+    expect(filterByNeedsReply(true, true, { waiting_since: 99 })).toBe(true);
+    expect(filterByNeedsReply(true, true, { waiting_since: 0 })).toBe(false);
+  });
+});
+
+describe('#applyPageFilters with needsReply', () => {
+  const conversation = (waitingSince, extra = {}) => ({
+    id: 1,
+    status: 'open',
+    inbox_id: 1,
+    labels: [],
+    meta: {},
+    waiting_since: waitingSince,
+    ...extra,
+  });
+
+  it('shows a waiting conversation and hides an answered one', () => {
+    const filters = { status: 'open', needsReply: true };
+    expect(applyPageFilters(conversation(99), filters)).toBe(true);
+    expect(applyPageFilters(conversation(0), filters)).toBe(false);
+  });
+
+  it('does not filter when the queue is All', () => {
+    const filters = { status: 'open', needsReply: false };
+    expect(applyPageFilters(conversation(0), filters)).toBe(true);
+  });
+});
+
+describe('#filterByViewMembership', () => {
+  const membership = {
+    mention: new Set([1]),
+    participating: new Set([2]),
+  };
+
+  it('is inert on the global queue', () => {
+    expect(filterByViewMembership(true, undefined, 99, membership)).toBe(true);
+  });
+
+  it('renders only conversations the finder returned for Mentions', () => {
+    expect(filterByViewMembership(true, 'mention', 1, membership)).toBe(true);
+    expect(filterByViewMembership(true, 'mention', 99, membership)).toBe(false);
+  });
+
+  it('renders only conversations the finder returned for Participating', () => {
+    expect(filterByViewMembership(true, 'participating', 2, membership)).toBe(
+      true
+    );
+    expect(filterByViewMembership(true, 'participating', 99, membership)).toBe(
+      false
+    );
+  });
+
+  it('does not filter before the view list response has landed', () => {
+    expect(filterByViewMembership(true, 'mention', 99, undefined)).toBe(true);
+    expect(filterByViewMembership(true, 'mention', 99, {})).toBe(true);
   });
 });

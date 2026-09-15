@@ -61,10 +61,32 @@ export const buildConversationList = (
   );
   context.commit(types.CLEAR_LIST_LOADING_STATUS);
   setContacts(context.commit, conversationList);
+
+  // Record which conversations the finder actually returned for the mention / participating
+  // views, so those views can filter their rendering without gating realtime insertion.
+  const { conversationType } = requestPayload;
+  if (conversationType === 'mention' || conversationType === 'participating') {
+    context.commit(types.SET_CONVERSATION_VIEW_MEMBERSHIP, {
+      view: conversationType,
+      ids: conversationList.map(conversation => conversation.id),
+    });
+  }
+
+  // A reconnect refetch is an unpaginated `updated_within` delta: it carries no page and only
+  // the rows that changed since the outage. Letting it through would write `page: null` into
+  // the cursor and, on an empty delta, permanently mark the list end-reached - disabling
+  // infinite scroll after any websocket blip.
+  const isReconnectDelta =
+    requestPayload.updatedWithin != null ||
+    requestPayload.updated_within != null;
+  if (isReconnectDelta) return;
+
+  const { page } = requestPayload;
   setPageFilter({
     dispatch: context.dispatch,
     filter: filterType,
-    page: requestPayload.page,
-    markEndReached: !conversationList.length,
+    page,
+    // Second belt: never mark end reached without a real page number.
+    markEndReached: page != null && !conversationList.length,
   });
 };

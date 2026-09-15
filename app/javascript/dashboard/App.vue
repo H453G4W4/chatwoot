@@ -20,6 +20,7 @@ import {
   verifyServiceWorkerExistence,
 } from './helper/pushHelper';
 import ReconnectService from 'dashboard/helper/ReconnectService';
+import { resetRealtimeState } from 'dashboard/store/modules/conversations/realtimeState';
 import { useUISettings } from 'dashboard/composables/useUISettings';
 
 export default {
@@ -54,6 +55,7 @@ export default {
   data() {
     return {
       latestChatwootVersion: null,
+      actionCableConnector: null,
       reconnectService: null,
     };
   },
@@ -88,9 +90,7 @@ export default {
     );
   },
   unmounted() {
-    if (this.reconnectService) {
-      this.reconnectService.disconnect();
-    }
+    this.teardownRealtimeServices();
   },
   methods: {
     initializeColorTheme() {
@@ -105,7 +105,30 @@ export default {
         this.$root.$i18n.locale = locale;
       }
     },
+    /**
+     * Tears the realtime stack down. Called on account switch, on teardown and nowhere else.
+     *
+     * Leaving the previous connector alive delivers every event twice and corrupts
+     * BaseActionCableConnector.isDisconnected, which is a CLASS-level static shared by every
+     * instance - so one connector's disconnect would flip the flag the other reads, breaking
+     * reconnect detection for both.
+     */
+    teardownRealtimeServices() {
+      this.actionCableConnector?.disconnect();
+      this.actionCableConnector = null;
+      this.reconnectService?.disconnect();
+      this.reconnectService = null;
+      window.reconnectService = null;
+      // The realtime fetch lifecycle is reset only from account switch, teardown and logout -
+      // never from a mutation, filter, route, pagination or queue switch, so changing a queue
+      // can never lose a customer message.
+      resetRealtimeState();
+    },
     async initializeAccount() {
+      // Tear down before anything else: the previous account's connector is already stale, and
+      // awaiting below would otherwise leave both alive while the new account loads.
+      this.teardownRealtimeServices();
+
       await this.$store.dispatch('accounts/get');
       this.$store.dispatch('setActiveAccount', {
         accountId: this.currentAccountId,
@@ -117,7 +140,7 @@ export default {
       // If user locale is set, use it; otherwise use account locale
       this.setLocale(this.uiSettings?.locale || locale);
       this.latestChatwootVersion = latestChatwootVersion;
-      vueActionCable.init(this.store, pubsubToken);
+      this.actionCableConnector = vueActionCable.init(this.store, pubsubToken);
       this.reconnectService = new ReconnectService(this.store, this.router);
       window.reconnectService = this.reconnectService;
 

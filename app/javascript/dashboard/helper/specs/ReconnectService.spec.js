@@ -156,6 +156,46 @@ describe('ReconnectService', () => {
     });
   });
 
+  describe('fetchConversations while Needs Reply is active', () => {
+    afterEach(() => {
+      delete storeMock.getters.getChatListFilters;
+    });
+
+    it('resets the list and fetches page 1 instead of merging a delta', async () => {
+      storeMock.getters.getChatListFilters = { needsReply: true };
+      reconnectService.getSecondsSinceDisconnect = vi.fn().mockReturnValue(100);
+
+      await reconnectService.fetchConversations();
+
+      // a delta cannot remove a conversation that stopped matching while offline
+      expect(storeMock.dispatch).toHaveBeenCalledWith('conversationPage/reset');
+      expect(storeMock.dispatch).toHaveBeenCalledWith('emptyAllConversations');
+      expect(storeMock.dispatch).toHaveBeenCalledWith('updateChatListFilters', {
+        page: 1,
+      });
+      expect(storeMock.dispatch).toHaveBeenCalledWith('fetchAllConversations');
+      expect(storeMock.dispatch).not.toHaveBeenCalledWith(
+        'updateChatListFilters',
+        expect.objectContaining({ updatedWithin: expect.anything() })
+      );
+    });
+
+    it('keeps the normal updated_within path when Needs Reply is inactive', async () => {
+      storeMock.getters.getChatListFilters = { needsReply: false };
+      reconnectService.getSecondsSinceDisconnect = vi.fn().mockReturnValue(100);
+
+      await reconnectService.fetchConversations();
+
+      expect(storeMock.dispatch).toHaveBeenCalledWith('updateChatListFilters', {
+        page: null,
+        updatedWithin: 115,
+      });
+      expect(storeMock.dispatch).not.toHaveBeenCalledWith(
+        'emptyAllConversations'
+      );
+    });
+  });
+
   describe('fetchFilteredOrSavedConversations', () => {
     it('should dispatch fetchFilteredConversations', async () => {
       const payload = { test: 'data' };

@@ -304,7 +304,7 @@ describe('#actions', () => {
         data: dataReceived,
       });
       await actions.fetchFilteredConversations(
-        { commit, dispatch },
+        { commit, dispatch, state: { listGeneration: 0 } },
         dataToSend
       );
       expect(commit).toHaveBeenCalledTimes(4);
@@ -322,7 +322,10 @@ describe('#actions', () => {
     it('clears the loading state and rethrows if the request fails', async () => {
       axios.post.mockRejectedValue(new Error('Request failed'));
       await expect(
-        actions.fetchFilteredConversations({ commit }, dataToSend)
+        actions.fetchFilteredConversations(
+          { commit, state: { listGeneration: 0 } },
+          dataToSend
+        )
       ).rejects.toThrow('Request failed');
       expect(commit.mock.calls).toEqual([
         ['SET_LIST_LOADING_STATUS'],
@@ -854,6 +857,32 @@ describe('#ensureAuthorizedConversation', () => {
     );
   });
 
+  it('discards a response once the store has moved to another account', async () => {
+    let currentAccountId = ACCOUNT_ID;
+    const rootGetters = {
+      get getCurrentAccountId() {
+        return currentAccountId;
+      },
+      getConversationById: () => null,
+    };
+    axios.get.mockImplementation(() => {
+      // the account switch lands while the authorized show is in flight
+      currentAccountId = 2;
+      return Promise.resolve({ data: { id: 5, account_id: ACCOUNT_ID } });
+    });
+
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+
+    expect(localDispatch).not.toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      expect.anything()
+    );
+  });
+
   it('does not let an older settled fetch delete a newer entry for the same id', async () => {
     const key = realtimeKey(ACCOUNT_ID, 5);
     axios.get.mockResolvedValue({ data: { id: 5, account_id: ACCOUNT_ID } });
@@ -974,5 +1003,155 @@ describe('#bufferMessageUpdateIfFetching', () => {
     );
     expect(axios.get).not.toHaveBeenCalled();
     expect(inflightFetches.size).toBe(0);
+  });
+});
+
+describe('#listGeneration stale-response protection', () => {
+  let localCommit;
+  let localDispatch;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localCommit = vi.fn();
+    localDispatch = vi.fn();
+  });
+
+  const commitNames = () => localCommit.mock.calls.map(c => c[0]);
+
+  describe('#fetchAllConversations', () => {
+    it('commits nothing when the list was reset while the page was in flight', async () => {
+      const state = { listGeneration: 0, conversationFilters: {} };
+      axios.get.mockImplementation(() => {
+        // EMPTY_ALL_CONVERSATION landed mid-flight (queue/filter/route switch)
+        state.listGeneration += 1;
+        return Promise.resolve({ data: { data: dataReceived } });
+      });
+
+      await actions.fetchAllConversations({
+        commit: localCommit,
+        state,
+        dispatch: localDispatch,
+      });
+
+      // only the loading flag set before the request; no rows, stats, cursor or loading clear
+      expect(commitNames()).toEqual(['SET_LIST_LOADING_STATUS']);
+      expect(localDispatch).not.toHaveBeenCalled();
+    });
+
+    it('does not clear the newer request loading state when a stale request fails', async () => {
+      const state = { listGeneration: 0, conversationFilters: {} };
+      axios.get.mockImplementation(() => {
+        state.listGeneration += 1;
+        return Promise.reject(new Error('Request failed'));
+      });
+
+      await actions.fetchAllConversations({
+        commit: localCommit,
+        state,
+        dispatch: localDispatch,
+      });
+
+      expect(commitNames()).toEqual(['SET_LIST_LOADING_STATUS']);
+      expect(commitNames()).not.toContain('CLEAR_LIST_LOADING_STATUS');
+    });
+
+    it('clears the loading state when the current request fails', async () => {
+      const state = { listGeneration: 0, conversationFilters: {} };
+      axios.get.mockRejectedValue(new Error('Request failed'));
+
+      await actions.fetchAllConversations({
+        commit: localCommit,
+        state,
+        dispatch: localDispatch,
+      });
+
+      // without this the spinner never clears and no page can load again
+      expect(commitNames()).toEqual([
+        'SET_LIST_LOADING_STATUS',
+        'CLEAR_LIST_LOADING_STATUS',
+      ]);
+    });
+  });
+
+  describe('#fetchFilteredConversations', () => {
+    it('commits nothing when the list was reset while the request was in flight', async () => {
+      const state = { listGeneration: 0 };
+      axios.post.mockImplementation(() => {
+        state.listGeneration += 1;
+        return Promise.resolve({ data: dataReceived });
+      });
+
+      await actions.fetchFilteredConversations(
+        { commit: localCommit, state, dispatch: localDispatch },
+        dataToSend
+      );
+
+      expect(commitNames()).toEqual(['SET_LIST_LOADING_STATUS']);
+    });
+
+    it('does not clear the newer request loading state when a stale request fails', async () => {
+      const state = { listGeneration: 0 };
+      axios.post.mockImplementation(() => {
+        state.listGeneration += 1;
+        return Promise.reject(new Error('Request failed'));
+      });
+
+      await expect(
+        actions.fetchFilteredConversations(
+          { commit: localCommit, state, dispatch: localDispatch },
+          dataToSend
+        )
+      ).rejects.toThrow('Request failed');
+
+      expect(commitNames()).toEqual(['SET_LIST_LOADING_STATUS']);
+    });
+  });
+});
+
+describe('#setConversationLastMessageId', () => {
+  it('uses the newest numeric server id and ignores an optimistic uuid tail', async () => {
+    const localCommit = vi.fn();
+    const state = {
+      allConversations: [
+        {
+          id: 1,
+          messages: [
+            { id: 100 },
+            { id: 200 },
+            { id: 'uuid-x', echo_id: 'uuid-x', status: 'progress' },
+          ],
+        },
+      ],
+    };
+
+    await actions.setConversationLastMessageId(
+      { commit: localCommit, state },
+      { conversationId: 1 }
+    );
+
+    // a uuid cursor would be clamped to 0 server-side and return the OLDEST messages
+    expect(localCommit).toHaveBeenCalledWith(
+      types.SET_LAST_MESSAGE_ID_IN_SYNC_CONVERSATION,
+      { conversationId: 1, messageId: 200 }
+    );
+  });
+
+  it('commits nothing when every loaded message is optimistic', async () => {
+    const localCommit = vi.fn();
+    const state = {
+      allConversations: [
+        {
+          id: 1,
+          messages: [{ id: 'uuid-a', echo_id: 'uuid-a', status: 'progress' }],
+        },
+      ],
+    };
+
+    await actions.setConversationLastMessageId(
+      { commit: localCommit, state },
+      { conversationId: 1 }
+    );
+
+    expect(localCommit).not.toHaveBeenCalled();
   });
 });

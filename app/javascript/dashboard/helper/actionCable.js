@@ -15,6 +15,7 @@ import { VOICE_CALL_PROVIDERS } from 'dashboard/helper/inbox';
 import { markCallDismissed, isLocalCall } from 'dashboard/helper/voice';
 import { VOICE_CALL_DIRECTION } from 'dashboard/components-next/message/constants';
 import { FEATURE_FLAGS } from 'dashboard/featureFlags';
+import { resetRealtimeState } from 'dashboard/store/modules/conversations/realtimeState';
 
 const { isImpersonating } = useImpersonation();
 const UNREAD_COUNTS_REFETCH_THROTTLE_MS = 5000;
@@ -31,6 +32,7 @@ class ActionCableConnector extends BaseActionCableConnector {
     const { websocketURL = '' } = window.chatwootConfig || {};
     super(app, pubsubToken, websocketURL);
     this.CancelTyping = [];
+    this.isTornDown = false;
     this.lastUnreadCountsFetchAt = null;
     this.unreadCountsFetchTimer = null;
     this.mentionUnreadCountsFetchTimer = null;
@@ -74,10 +76,45 @@ class ActionCableConnector extends BaseActionCableConnector {
     emitter.emit(BUS_EVENTS.WEBSOCKET_RECONNECT);
   };
 
-  // eslint-disable-next-line class-methods-use-this
   onDisconnected = () => {
+    // A deliberate teardown is not a network loss. The banner it would raise is cleared only by
+    // a reconnect event, which the NEW connector never sends because it never disconnected.
+    if (this.isTornDown) return;
     emitter.emit(BUS_EVENTS.WEBSOCKET_DISCONNECT);
   };
+
+  /**
+   * Teardown on account switch, logout or unmount.
+   *
+   * The base class only closes the socket. Its `disconnected` callback then emits
+   * WEBSOCKET_DISCONNECT and arms a 1 Hz reconnect poll that can never be cleared once the
+   * caller drops its reference, so the flag below suppresses both. This connector's own
+   * timers are cleared here too - otherwise they keep dispatching into the singleton store
+   * with the previous account's data long after the socket is gone.
+   */
+  disconnect() {
+    this.isTornDown = true;
+    this.clearUnreadCountsFetchTimer();
+    clearTimeout(this.mentionUnreadCountsFetchTimer);
+    clearTimeout(this.mentionUnreadCountsRetryTimer);
+    clearTimeout(this.filteredUnreadCountsRetryTimer);
+    this.mentionUnreadCountsFetchTimer = null;
+    this.mentionUnreadCountsRetryTimer = null;
+    this.filteredUnreadCountsRetryTimer = null;
+    Object.values(this.CancelTyping).forEach(timer => clearTimeout(timer));
+    this.CancelTyping = [];
+    super.disconnect();
+    this.clearReconnectTimer();
+  }
+
+  checkConnection() {
+    // The socket close that follows a teardown must not restart the reconnect poll.
+    if (this.isTornDown) {
+      this.clearReconnectTimer();
+      return;
+    }
+    super.checkConnection();
+  }
 
   isAValidEvent = data => {
     return this.app.$store.getters.getCurrentAccountId === data.account_id;
@@ -152,14 +189,25 @@ class ActionCableConnector extends BaseActionCableConnector {
   };
 
   // eslint-disable-next-line class-methods-use-this
-  onLogout = () => AuthAPI.logout();
+  onLogout = () => {
+    // Drop every buffered realtime entry and invalidate in-flight authorized fetches before
+    // the session ends, so nothing from this user can commit afterwards.
+    resetRealtimeState();
+    return AuthAPI.logout();
+  };
 
   onMessageCreated = data => {
     // message.created is the only event a buried conversation reliably produces, and its
     // payload has no guaranteed conversation node, so never destructure it unguarded.
     const conversationId = data.conversation_id;
     const lastActivityAt = data.conversation?.last_activity_at;
-    DashboardAudioNotificationHelper.onNewMessage(data);
+    try {
+      // An alert failure must never abort the store dispatches below - losing the reorder or
+      // the authorized fetch because a sound could not play is far worse than a silent alert.
+      DashboardAudioNotificationHelper.onNewMessage(data);
+    } catch (error) {
+      // ignore
+    }
     if (this.isConversationPresent(conversationId)) {
       this.app.$store.dispatch('addMessage', data);
       this.app.$store.dispatch('updateConversationLastActivity', {

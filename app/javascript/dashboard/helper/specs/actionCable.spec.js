@@ -1,11 +1,22 @@
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest';
 import ActionCableConnector from '../actionCable';
+import AuthAPI from '../../api/auth';
+import DashboardAudioNotificationHelper from '../AudioAlerts/DashboardAudioNotificationHelper';
+import { emitter } from 'shared/helpers/mitt';
+import { BUS_EVENTS } from 'shared/constants/busEvents';
+import { resetRealtimeState } from 'dashboard/store/modules/conversations/realtimeState';
 import { FEATURE_FLAGS } from 'dashboard/featureFlags';
 
 vi.mock('shared/helpers/mitt', () => ({
   emitter: {
     emit: vi.fn(),
   },
+}));
+
+vi.mock('../../api/auth', () => ({ default: { logout: vi.fn() } }));
+
+vi.mock('dashboard/store/modules/conversations/realtimeState', () => ({
+  resetRealtimeState: vi.fn(),
 }));
 
 // The audio alert helper reads account/route state this spec does not build. Isolating it
@@ -495,6 +506,44 @@ describe('ActionCableConnector - unknown conversation authorization routing', ()
     });
   });
 
+  describe('audio alert isolation', () => {
+    it('still processes the message when the audio helper throws', () => {
+      DashboardAudioNotificationHelper.onNewMessage.mockImplementationOnce(
+        () => {
+          throw new Error('audio device unavailable');
+        }
+      );
+      present = { id: 5 };
+
+      expect(() =>
+        connector.onMessageCreated({
+          conversation_id: 5,
+          id: 1,
+          conversation: { last_activity_at: 1200 },
+        })
+      ).not.toThrow();
+
+      // the reorder and the store dispatches must survive an alert failure
+      expect(dispatched('addMessage')).toHaveLength(1);
+      expect(dispatched('updateConversationLastActivity')).toHaveLength(1);
+    });
+
+    it('still authorizes an unknown conversation when the audio helper throws', () => {
+      DashboardAudioNotificationHelper.onNewMessage.mockImplementationOnce(
+        () => {
+          throw new Error('audio device unavailable');
+        }
+      );
+      present = null;
+
+      expect(() =>
+        connector.onMessageCreated({ conversation_id: 7, id: 2 })
+      ).not.toThrow();
+
+      expect(dispatched('ensureAuthorizedConversation')).toHaveLength(1);
+    });
+  });
+
   describe('security invariant', () => {
     it('never consults a role, so no role can shortcut the authorized fetch', () => {
       // The handlers receive only the cable payload and the presence of the conversation in
@@ -508,5 +557,115 @@ describe('ActionCableConnector - unknown conversation authorization routing', ()
       expect(dispatched('addConversation')).toHaveLength(0);
       expect(dispatched('upsertFetchedConversation')).toHaveLength(0);
     });
+  });
+});
+
+describe('ActionCableConnector - logout lifecycle', () => {
+  let connector;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    connector = ActionCableConnector.init(
+      {
+        dispatch: vi.fn(),
+        getters: {
+          getCurrentAccountId: 1,
+          getConversationById: () => null,
+          'accounts/isFeatureEnabledonAccount': vi.fn(() => true),
+        },
+      },
+      'test-token'
+    );
+  });
+
+  it('resets realtime state before ending the session', () => {
+    const order = [];
+    resetRealtimeState.mockImplementation(() => order.push('reset'));
+    AuthAPI.logout.mockImplementation(() => order.push('logout'));
+
+    connector.onLogout();
+
+    expect(order).toEqual(['reset', 'logout']);
+  });
+
+  it('registers onLogout for the user:logout event', () => {
+    expect(connector.events['user:logout']).toBe(connector.onLogout);
+  });
+});
+
+describe('ActionCableConnector - teardown is not a network loss', () => {
+  let connector;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    connector = ActionCableConnector.init(
+      {
+        dispatch: vi.fn(),
+        getters: {
+          getCurrentAccountId: 1,
+          getConversationById: () => null,
+          'accounts/isFeatureEnabledonAccount': vi.fn(() => true),
+        },
+      },
+      'test-token'
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does not raise the offline banner when the socket closes after a teardown', () => {
+    connector.disconnect();
+    emitter.emit.mockClear();
+
+    // the websocket close is async, so the base class fires this afterwards
+    connector.onDisconnected();
+
+    expect(emitter.emit).not.toHaveBeenCalledWith(
+      BUS_EVENTS.WEBSOCKET_DISCONNECT
+    );
+  });
+
+  it('still raises the offline banner for a genuine network loss', () => {
+    emitter.emit.mockClear();
+
+    connector.onDisconnected();
+
+    expect(emitter.emit).toHaveBeenCalledWith(BUS_EVENTS.WEBSOCKET_DISCONNECT);
+  });
+
+  it('stops the reconnect poll instead of re-arming it forever', () => {
+    connector.disconnect();
+    const clearSpy = vi.spyOn(connector, 'clearReconnectTimer');
+
+    // the base class arms this from its disconnected callback; the timer must not re-arm
+    connector.initReconnectTimer();
+    vi.advanceTimersByTime(5000);
+
+    expect(clearSpy).toHaveBeenCalled();
+    expect(connector.reconnectTimer).toBeNull();
+  });
+
+  it('clears its own timers so the previous account cannot keep dispatching', () => {
+    connector.unreadCountsFetchTimer = setTimeout(() => {}, 100000);
+    connector.mentionUnreadCountsFetchTimer = setTimeout(() => {}, 100000);
+    connector.mentionUnreadCountsRetryTimer = setTimeout(() => {}, 100000);
+    connector.filteredUnreadCountsRetryTimer = setTimeout(() => {}, 100000);
+    connector.CancelTyping[42] = setTimeout(() => {}, 100000);
+
+    connector.disconnect();
+
+    expect(connector.unreadCountsFetchTimer).toBeNull();
+    expect(connector.mentionUnreadCountsFetchTimer).toBeNull();
+    expect(connector.mentionUnreadCountsRetryTimer).toBeNull();
+    expect(connector.filteredUnreadCountsRetryTimer).toBeNull();
+    expect(connector.CancelTyping).toEqual([]);
+    // Exactly one timer survives: BaseActionCableConnector's 20s presence chain, which its
+    // disconnect() has never cleared. That is a pre-existing upstream leak in shared widget
+    // code and is deliberately out of scope for this phase - asserted here so the residual is
+    // documented and any future change to it fails loudly.
+    expect(vi.getTimerCount()).toBe(1);
   });
 });

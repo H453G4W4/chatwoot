@@ -114,7 +114,11 @@ const getters = {
       if (watchers && !watchers.some(w => w.id === currentUserId)) {
         return false;
       }
-      return applyPageFilters(conversation, activeFilters);
+      return applyPageFilters(
+        conversation,
+        activeFilters,
+        _state.viewMembership
+      );
     });
   },
   getAllStatusChats: (_state, _, __, rootGetters) => activeFilters => {
@@ -126,7 +130,11 @@ const getters = {
     const userRole = getUserRole(currentUser, currentAccountId);
 
     return _state.allConversations.filter(conversation => {
-      const shouldFilter = applyPageFilters(conversation, activeFilters);
+      const shouldFilter = applyPageFilters(
+        conversation,
+        activeFilters,
+        _state.viewMembership
+      );
       const allowedForRole = applyRoleFilter(
         conversation,
         userRole,

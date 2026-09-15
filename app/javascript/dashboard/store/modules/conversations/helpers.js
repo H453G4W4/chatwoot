@@ -35,8 +35,45 @@ export const filterByUnattended = (
     : shouldFilter;
 };
 
-export const applyPageFilters = (conversation, filters) => {
-  const { inboxId, status, labels = [], teamId, conversationType } = filters;
+/** waiting_since is serialized as 0 when nil in every payload, so never use a null check. */
+export const isWaitingForReply = conversation =>
+  Number(conversation.waiting_since) > 0;
+
+export const filterByNeedsReply = (shouldFilter, needsReply, conversation) =>
+  needsReply ? isWaitingForReply(conversation) && shouldFilter : shouldFilter;
+
+const MEMBERSHIP_VIEWS = ['mention', 'participating'];
+
+/**
+ * Render-side protection for Mentions and Participating.
+ *
+ * The realtime pipeline stores every authorized conversation regardless of the route the agent
+ * is on - that is deliberate, so a customer message is never lost. These views therefore have
+ * to filter what they RENDER, using the ids the finder returned for the view. This is not an
+ * insertion gate: the conversation stays in the store and shows up on the global queue.
+ */
+export const filterByViewMembership = (
+  shouldFilter,
+  conversationType,
+  conversationId,
+  viewMembership
+) => {
+  if (!MEMBERSHIP_VIEWS.includes(conversationType)) return shouldFilter;
+  const members = viewMembership?.[conversationType];
+  // Before the view's own list response has landed there is nothing to filter against.
+  if (!members) return shouldFilter;
+  return members.has(conversationId) && shouldFilter;
+};
+
+export const applyPageFilters = (conversation, filters, viewMembership) => {
+  const {
+    inboxId,
+    status,
+    labels = [],
+    teamId,
+    conversationType,
+    needsReply,
+  } = filters;
   const {
     status: chatStatus,
     inbox_id: chatInboxId,
@@ -57,6 +94,13 @@ export const applyPageFilters = (conversation, filters) => {
     conversationType,
     firstReplyOn,
     waitingSince
+  );
+  shouldFilter = filterByNeedsReply(shouldFilter, needsReply, conversation);
+  shouldFilter = filterByViewMembership(
+    shouldFilter,
+    conversationType,
+    conversation.id,
+    viewMembership
   );
 
   return shouldFilter;

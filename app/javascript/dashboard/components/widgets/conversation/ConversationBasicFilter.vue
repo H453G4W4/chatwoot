@@ -24,18 +24,11 @@ const { t } = useI18n();
 const { updateUISettings } = useUISettings();
 
 const chatStatusFilter = useMapGetter('getChatStatusFilter');
-const chatSortFilter = useMapGetter('getChatSortFilter');
 
 const [showActionsDropdown, toggleDropdown] = useToggle();
 
 const currentStatusFilter = computed(() => {
   return chatStatusFilter.value || wootConstants.STATUS_TYPE.OPEN;
-});
-
-const currentSortBy = computed(() => {
-  return (
-    chatSortFilter.value || wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC
-  );
 });
 
 const chatStatusOptions = computed(() => [
@@ -61,66 +54,19 @@ const chatStatusOptions = computed(() => [
   },
 ]);
 
-const chatSortOptions = computed(() => [
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.last_activity_at_asc.TEXT'),
-    value: 'last_activity_at_asc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.last_activity_at_desc.TEXT'),
-    value: 'last_activity_at_desc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.created_at_desc.TEXT'),
-    value: 'created_at_desc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.created_at_asc.TEXT'),
-    value: 'created_at_asc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.unread.TEXT'),
-    value: 'unread',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.priority_desc.TEXT'),
-    value: 'priority_desc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.priority_asc.TEXT'),
-    value: 'priority_asc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.priority_desc_created_at_asc.TEXT'),
-    value: 'priority_desc_created_at_asc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.waiting_since_asc.TEXT'),
-    value: 'waiting_since_asc',
-  },
-  {
-    label: t('CHAT_LIST.SORT_ORDER_ITEMS.waiting_since_desc.TEXT'),
-    value: 'waiting_since_desc',
-  },
-]);
-
 const activeChatStatusLabel = computed(
   () =>
     chatStatusOptions.value.find(m => m.value === chatStatusFilter.value)
       ?.label || ''
 );
 
-const activeChatSortLabel = computed(
-  () =>
-    chatSortOptions.value.find(m => m.value === chatSortFilter.value)?.label ||
-    ''
-);
-
+// The global queue is always ordered newest-activity-first, so there is no sort control left
+// to echo here. order_by is pinned to keep the persisted shape stable for older clients.
 const saveSelectedFilter = (type, value) => {
   updateUISettings({
     conversations_filter_by: {
       status: type === 'status' ? value : currentStatusFilter.value,
-      order_by: type === 'sort' ? value : currentSortBy.value,
+      order_by: wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC,
     },
   });
 };
@@ -129,12 +75,6 @@ const handleStatusChange = value => {
   emit('changeFilter', value, 'status');
   store.dispatch('setChatStatusFilter', value);
   saveSelectedFilter('status', value);
-};
-
-const handleSortChange = value => {
-  emit('changeFilter', value, 'sort');
-  store.dispatch('setChatSortFilter', value);
-  saveSelectedFilter('sort', value);
 };
 </script>
 
@@ -167,18 +107,6 @@ const handleSortChange = value => {
           :label="activeChatStatusLabel"
           :sub-menu-position="isOnExpandedLayout ? 'left' : 'right'"
           @update:model-value="handleStatusChange"
-        />
-      </div>
-      <div class="flex items-center justify-between last:mt-4 gap-2">
-        <span class="text-sm truncate text-n-slate-12">
-          {{ $t('CHAT_LIST.CHAT_SORT.ORDER_BY') }}
-        </span>
-        <SelectMenu
-          :model-value="chatSortFilter"
-          :options="chatSortOptions"
-          :label="activeChatSortLabel"
-          :sub-menu-position="isOnExpandedLayout ? 'left' : 'right'"
-          @update:model-value="handleSortChange"
         />
       </div>
     </div>

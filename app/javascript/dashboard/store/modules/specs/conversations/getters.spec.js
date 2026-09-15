@@ -721,4 +721,78 @@ describe('#getters', () => {
       ]);
     });
   });
+
+  describe('Mentions / Participating render safety', () => {
+    const rootGetters = {
+      getCurrentUser: {
+        id: 1,
+        accounts: [{ id: 1, role: 'administrator', permissions: [] }],
+      },
+      getCurrentAccountId: 1,
+      'conversationWatchers/getByConversationId': () => undefined,
+    };
+    const mentioned = {
+      id: 10,
+      status: 'open',
+      inbox_id: 1,
+      labels: [],
+      meta: {},
+      waiting_since: 0,
+    };
+    const unrelated = {
+      id: 99,
+      status: 'open',
+      inbox_id: 1,
+      labels: [],
+      meta: {},
+      waiting_since: 0,
+    };
+
+    // The realtime pipeline stores every authorized conversation regardless of route, so the
+    // store legitimately holds a conversation that has nothing to do with Mentions.
+    const state = {
+      allConversations: [mentioned, unrelated],
+      viewMembership: { mention: new Set([10]), participating: new Set([10]) },
+    };
+
+    it('renders only the mentioned conversation in Mentions', () => {
+      const result = getters.getAllStatusChats(
+        state,
+        null,
+        null,
+        rootGetters
+      )({
+        status: 'open',
+        conversationType: 'mention',
+      });
+      expect(result.map(c => c.id)).toEqual([10]);
+    });
+
+    it('renders only the participating conversation in Participating', () => {
+      const result = getters.getParticipatingChats(
+        state,
+        null,
+        null,
+        rootGetters
+      )({
+        status: 'open',
+        conversationType: 'participating',
+      });
+      expect(result.map(c => c.id)).toEqual([10]);
+    });
+
+    it('still keeps the unrelated conversation stored and visible on the global queue', () => {
+      expect(state.allConversations.map(c => c.id)).toContain(99);
+
+      const result = getters.getAllStatusChats(
+        state,
+        null,
+        null,
+        rootGetters
+      )({
+        status: 'open',
+      });
+      expect(result.map(c => c.id)).toEqual([10, 99]);
+    });
+  });
 });

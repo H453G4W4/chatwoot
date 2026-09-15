@@ -48,7 +48,22 @@ class ReconnectService {
     }
   };
 
+  isNeedsReplyActive = () =>
+    Boolean(this.store.getters.getChatListFilters?.needsReply);
+
   fetchConversations = async () => {
+    // An `updated_within` delta only returns rows that STILL match, and SET_ALL_CONVERSATION
+    // never removes. While Needs Reply is active a conversation answered by someone else
+    // during the outage would therefore linger in the list forever, so reset and refetch
+    // page 1 instead of merging a delta.
+    if (this.isNeedsReplyActive()) {
+      await this.store.dispatch('conversationPage/reset');
+      await this.store.dispatch('emptyAllConversations');
+      await this.store.dispatch('updateChatListFilters', { page: 1 });
+      await this.store.dispatch('fetchAllConversations');
+      return;
+    }
+
     await this.store.dispatch('updateChatListFilters', {
       page: null,
       updatedWithin:

@@ -8,7 +8,7 @@ import {
   isOnMentionsView,
   isOnUnattendedView,
 } from './helpers/actionHelpers';
-import { compareMessages } from './helpers';
+import { compareMessages, isNumericMessageId } from './helpers';
 import {
   bufferConversationPayload,
   bufferMessage,
@@ -160,11 +160,16 @@ const actions = {
 
   fetchAllConversations: async ({ commit, state, dispatch }) => {
     commit(types.SET_LIST_LOADING_STATUS);
+    const generation = state.listGeneration;
     try {
       const params = state.conversationFilters;
       const {
         data: { data },
       } = await ConversationApi.get(params);
+      // The list was reset while this page was in flight, so a newer request now owns the
+      // list and the spinner. Commit nothing at all - not the rows, the counters, the stats,
+      // the end-reached flag or the loading status.
+      if (generation !== state.listGeneration) return;
       buildConversationList(
         { commit, dispatch },
         params,
@@ -172,14 +177,19 @@ const actions = {
         params.assigneeType
       );
     } catch (error) {
-      // Handle error
+      if (generation !== state.listGeneration) return;
+      // Without this the list spins forever: the infinite-scroll sentinel stays unmounted and
+      // loadMoreConversations early-returns, so only a reload recovers.
+      commit(types.CLEAR_LIST_LOADING_STATUS);
     }
   },
 
-  fetchFilteredConversations: async ({ commit, dispatch }, params) => {
+  fetchFilteredConversations: async ({ commit, state, dispatch }, params) => {
     commit(types.SET_LIST_LOADING_STATUS);
+    const generation = state.listGeneration;
     try {
       const { data } = await ConversationApi.filter(params);
+      if (generation !== state.listGeneration) return;
       buildConversationList(
         { commit, dispatch },
         params,
@@ -187,7 +197,10 @@ const actions = {
         'appliedFilters'
       );
     } catch (error) {
-      commit(types.CLEAR_LIST_LOADING_STATUS);
+      // A stale failure must not clear the newer request's loading state.
+      if (generation === state.listGeneration) {
+        commit(types.CLEAR_LIST_LOADING_STATUS);
+      }
       throw error;
     }
   },
@@ -299,7 +312,12 @@ const actions = {
     );
     if (!selectedChat) return;
     const { messages } = selectedChat;
-    const lastMessage = messages.last();
+    // An optimistic uuid can sit at the tail after a failed or in-flight send. MessageFinder
+    // clamps a non-numeric `after` to 0 and would return the 100 OLDEST messages, so the
+    // messages missed during the outage would never be fetched. Use the newest server id.
+    const lastMessage = [...messages]
+      .reverse()
+      .find(message => isNumericMessageId(message.id));
     if (!lastMessage) return;
     commit(types.SET_LAST_MESSAGE_ID_IN_SYNC_CONVERSATION, {
       conversationId,

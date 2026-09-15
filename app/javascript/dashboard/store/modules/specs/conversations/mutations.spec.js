@@ -1535,3 +1535,62 @@ describe('#ADD_MESSAGE unread freshness with an optimistic tail', () => {
     expect(chat.incomingVersion).toBeUndefined();
   });
 });
+
+describe('#EMPTY_ALL_CONVERSATION listGeneration', () => {
+  it('increments the list generation so in-flight page responses are invalidated', () => {
+    const state = {
+      allConversations: [{ id: 1 }],
+      selectedChatId: 1,
+      listGeneration: 0,
+    };
+    mutations[types.EMPTY_ALL_CONVERSATION](state);
+    expect(state.allConversations).toEqual([]);
+    expect(state.selectedChatId).toBeNull();
+    expect(state.listGeneration).toBe(1);
+    mutations[types.EMPTY_ALL_CONVERSATION](state);
+    expect(state.listGeneration).toBe(2);
+  });
+
+  it('is the only mutation that changes the list generation', () => {
+    const state = {
+      allConversations: [{ id: 1, messages: [] }],
+      selectedChatId: -1,
+      listGeneration: 5,
+    };
+    mutations[types.ADD_MESSAGE](state, {
+      id: 1,
+      conversation_id: 1,
+      created_at: 1,
+    });
+    mutations[types.UPDATE_CONVERSATION](state, { id: 1, updated_at: 2 });
+    mutations[types.UPSERT_CONVERSATION](state, { id: 2 });
+    mutations[types.SET_ALL_CONVERSATION](state, [{ id: 3 }]);
+    expect(state.listGeneration).toBe(5);
+  });
+});
+
+describe('#viewMembership for Mentions / Participating rendering', () => {
+  it('accumulates ids for a view without dropping earlier pages', () => {
+    const state = {
+      viewMembership: { mention: new Set([1]), participating: new Set() },
+    };
+    mutations[types.SET_CONVERSATION_VIEW_MEMBERSHIP](state, {
+      view: 'mention',
+      ids: [2, 3],
+    });
+    expect([...state.viewMembership.mention]).toEqual([1, 2, 3]);
+    expect([...state.viewMembership.participating]).toEqual([]);
+  });
+
+  it('is cleared by the normal list reset', () => {
+    const state = {
+      allConversations: [{ id: 1 }],
+      selectedChatId: 1,
+      listGeneration: 0,
+      viewMembership: { mention: new Set([1, 2]), participating: new Set([3]) },
+    };
+    mutations[types.EMPTY_ALL_CONVERSATION](state);
+    expect([...state.viewMembership.mention]).toEqual([]);
+    expect([...state.viewMembership.participating]).toEqual([]);
+  });
+});

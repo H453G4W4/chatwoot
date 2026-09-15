@@ -1,4 +1,6 @@
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest';
+import { mutations } from '../../conversations';
+import mutationTypes from '../../../mutation-types';
 import {
   DEBOUNCE_MS,
   MAX_CONCURRENT,
@@ -230,5 +232,34 @@ describe('realtimeState', () => {
       bufferConversationPayload(entry, { id: 1, updated_at: 900 });
       expect(entry.conversationPayload.updated_at).toBe(900);
     });
+  });
+});
+
+describe('realtimeState is not touched by ordinary list lifecycle', () => {
+  beforeEach(() => {
+    resetRealtimeState();
+  });
+  afterEach(() => {
+    resetRealtimeState();
+  });
+
+  it('EMPTY_ALL_CONVERSATION does not reset the realtime lifecycle', () => {
+    const entry = createInflightEntry(1);
+    inflightFetches.set(realtimeKey(1, 5), entry);
+    const generationBefore = getAccountGeneration();
+
+    const state = {
+      allConversations: [{ id: 5 }],
+      selectedChatId: 5,
+      listGeneration: 0,
+    };
+    mutations[mutationTypes.EMPTY_ALL_CONVERSATION](state);
+
+    // the list generation moves, the realtime lifecycle does not: a queue, filter, route or
+    // pagination reset must never drop a buffered customer message
+    expect(state.listGeneration).toBe(1);
+    expect(getAccountGeneration()).toBe(generationBefore);
+    expect(inflightFetches.get(realtimeKey(1, 5))).toBe(entry);
+    expect(entry.cancelled).toBe(false);
   });
 });

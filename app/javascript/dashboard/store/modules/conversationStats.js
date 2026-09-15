@@ -6,6 +6,7 @@ const state = {
   mineCount: 0,
   unAssignedCount: 0,
   allCount: 0,
+  needsReplyCount: 0,
 };
 
 export const getters = {
@@ -61,14 +62,18 @@ export const mutations = {
   [types.SET_CONV_TAB_META](
     $state,
     {
-      mine_count: mineCount,
-      unassigned_count: unAssignedCount,
-      all_count: allCount,
+      mine_count: mineCount = 0,
+      unassigned_count: unAssignedCount = 0,
+      all_count: allCount = 0,
+      // The folder/advanced-filter endpoint uses a different count implementation that does
+      // not return needs_reply_count, so it must default rather than land as undefined.
+      needs_reply_count: needsReplyCount = 0,
     } = {}
   ) {
     $state.mineCount = mineCount;
     $state.allCount = allCount;
     $state.unAssignedCount = unAssignedCount;
+    $state.needsReplyCount = needsReplyCount;
     $state.updatedOn = new Date();
   },
 };
