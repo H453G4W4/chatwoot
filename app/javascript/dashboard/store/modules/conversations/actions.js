@@ -174,7 +174,7 @@ const actions = {
         { commit, dispatch },
         params,
         data,
-        params.assigneeType
+        params.needsReply ? 'needsReply' : params.assigneeType
       );
     } catch (error) {
       if (generation !== state.listGeneration) return;

@@ -726,4 +726,65 @@ RSpec.describe ReplyMailbox do
       end
     end
   end
+
+  # Guards the fix end to end through the real ActionMailbox path, so a change to the
+  # Conversation callback order cannot silently reintroduce the creation stamp.
+  describe 'needs reply exclusion on a new email conversation' do
+    let(:account) { create(:account) }
+    let!(:channel_email) { create(:channel_email, email: 'support@example.com', account: account) }
+    let(:order_subject) { "[Evestv #1 The Best IPTV Subscription]: You've got a new order: #12252" }
+    let(:order_rule) { %([{"from":"admin@evestv.com","subject_contains":"You've got a new order:"}]) }
+
+    it 'opens the conversation without waiting_since for a matching order notification' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     subject: order_subject, body: 'Order #12252 has been placed.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      conversation = Conversation.last
+      expect(conversation.additional_attributes['mail_subject']).to eq(order_subject)
+      expect(conversation.contact.email).to eq('admin@evestv.com')
+      expect(conversation.messages.last.message_type).to eq('incoming')
+      expect(conversation.waiting_since).to be_nil
+    end
+
+    it 'opens the conversation with waiting_since for a contact form email from the same sender' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     subject: 'Contact form: I need help with my subscription',
+                                                     body: 'My subscription stopped working.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      expect(Conversation.last.waiting_since).not_to be_nil
+    end
+
+    it 'keys the rule on the contact address, which Chatwoot resolves from Reply-To before From' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     reply_to: 'buyer@example.com', subject: order_subject,
+                                                     body: 'Order #12252 has been placed.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      conversation = Conversation.last
+      expect(conversation.contact.email).to eq('buyer@example.com')
+      expect(conversation.waiting_since).not_to be_nil
+    end
+
+    it 'opens the conversation with waiting_since when no rules are configured' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     subject: order_subject, body: 'Order #12252 has been placed.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: nil do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      expect(Conversation.last.waiting_since).not_to be_nil
+    end
+  end
 end

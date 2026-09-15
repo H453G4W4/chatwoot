@@ -14,6 +14,7 @@ const dataToSend = {
   ],
 };
 import { dataReceived } from './testConversationResponse';
+import conversationPage from '../../conversationPage';
 import {
   inflightFetches,
   realtimeKey,
@@ -1153,5 +1154,110 @@ describe('#setConversationLastMessageId', () => {
     );
 
     expect(localCommit).not.toHaveBeenCalled();
+  });
+});
+
+describe('#Needs Reply pagination', () => {
+  // Wires the real conversationPage module to fetchAllConversations, so the page cursor is
+  // written and read through the same key the ChatList reads (`needsReply`, not `all`).
+  const buildPageStore = () => {
+    const pageState = JSON.parse(JSON.stringify(conversationPage.state));
+    const localDispatch = vi.fn((actionName, payload) => {
+      const [namespace, name] = actionName.split('/');
+      if (namespace === 'conversationPage') {
+        conversationPage.actions[name](
+          {
+            commit: (type, mutationPayload) =>
+              conversationPage.mutations[type](pageState, mutationPayload),
+          },
+          payload
+        );
+      }
+      return Promise.resolve();
+    });
+    return { pageState, localDispatch };
+  };
+
+  const conversationsPage = [{ id: 1, meta: { sender: { id: 11 } } }];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // The ChatList asks for `currentPage + 1` on every infinite-scroll load.
+  const scrollThreePages = async ({ pageState, localDispatch, needsReply }) => {
+    const requestedPages = [];
+    axios.get.mockImplementation((url, { params }) => {
+      requestedPages.push(params.page);
+      return Promise.resolve({
+        data: { data: { payload: conversationsPage, meta: {} } },
+      });
+    });
+
+    const filterKey = needsReply ? 'needsReply' : 'all';
+    const state = { listGeneration: 0, conversationFilters: {} };
+
+    for (let load = 0; load < 3; load += 1) {
+      state.conversationFilters = {
+        assigneeType: 'all',
+        needsReply,
+        page: pageState.currentPage[filterKey] + 1,
+      };
+      // eslint-disable-next-line no-await-in-loop
+      await actions.fetchAllConversations({
+        commit: vi.fn(),
+        state,
+        dispatch: localDispatch,
+      });
+    }
+
+    return requestedPages;
+  };
+
+  it('advances page 1 -> 2 -> 3 on the Needs Reply queue and never re-requests page 1', async () => {
+    const { pageState, localDispatch } = buildPageStore();
+
+    const requestedPages = await scrollThreePages({
+      pageState,
+      localDispatch,
+      needsReply: true,
+    });
+
+    // Writing the cursor under `all` while the ChatList reads `needsReply` left the cursor at
+    // 0, so infinite scroll asked for page 1 forever.
+    expect(requestedPages).toEqual([1, 2, 3]);
+    expect(pageState.currentPage.needsReply).toBe(3);
+    expect(pageState.currentPage.all).toBe(0);
+  });
+
+  it('advances page 1 -> 2 -> 3 on the All queue and leaves the Needs Reply cursor alone', async () => {
+    const { pageState, localDispatch } = buildPageStore();
+
+    const requestedPages = await scrollThreePages({
+      pageState,
+      localDispatch,
+      needsReply: false,
+    });
+
+    expect(requestedPages).toEqual([1, 2, 3]);
+    expect(pageState.currentPage.all).toBe(3);
+    expect(pageState.currentPage.needsReply).toBe(0);
+  });
+
+  it('marks only the Needs Reply queue end reached when a Needs Reply page comes back empty', async () => {
+    const { pageState, localDispatch } = buildPageStore();
+    axios.get.mockResolvedValue({ data: { data: { payload: [], meta: {} } } });
+
+    await actions.fetchAllConversations({
+      commit: vi.fn(),
+      state: {
+        listGeneration: 0,
+        conversationFilters: { assigneeType: 'all', needsReply: true, page: 1 },
+      },
+      dispatch: localDispatch,
+    });
+
+    expect(pageState.hasEndReached.needsReply).toBe(true);
+    expect(pageState.hasEndReached.all).toBe(false);
   });
 });

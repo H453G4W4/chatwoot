@@ -357,7 +357,19 @@ class Message < ApplicationRecord
 
   def set_waiting_since_on_incoming_message
     # Set waiting_since when customer sends a message (if currently blank)
-    conversation.update(waiting_since: created_at) if incoming? && conversation.waiting_since.blank?
+    return unless incoming? && conversation.waiting_since.blank?
+    return if excluded_from_needs_reply?
+
+    conversation.update(waiting_since: created_at)
+  end
+
+  # An excluded notification email never raises Needs Reply. See NeedsReplyExclusion: the rules
+  # are shared with Conversation#ensure_waiting_since, which suppresses the creation stamp when
+  # the conversation is opened by one of these notifications.
+  def excluded_from_needs_reply?
+    return false unless incoming? && inbox.email? && sender.is_a?(Contact)
+
+    NeedsReplyExclusion.excluded?(sender_email: sender.email, subject: content_attributes.dig(:email, :subject))
   end
 
   def human_response?

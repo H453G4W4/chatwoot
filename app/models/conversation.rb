@@ -297,7 +297,21 @@ class Conversation < ApplicationRecord
   end
 
   def ensure_waiting_since
+    return if excluded_notification_email?
+
     self.waiting_since = created_at
+  end
+
+  # A conversation opened by an excluded notification email must not start out waiting for a reply.
+  # NeedsReplyExclusion holds the rules, shared with Message#excluded_from_needs_reply?, which keeps
+  # later notifications on the same conversation from raising it either. Neither ever clears an
+  # existing waiting_since - only a human reply or a resolve does that.
+  def excluded_notification_email?
+    subject = additional_attributes&.dig('mail_subject')
+    return false if subject.blank?
+    return false unless inbox.email?
+
+    NeedsReplyExclusion.excluded?(sender_email: contact&.email, subject: subject)
   end
 
   def validate_additional_attributes

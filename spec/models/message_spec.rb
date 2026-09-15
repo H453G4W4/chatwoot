@@ -385,6 +385,179 @@ RSpec.describe Message do
         expect(conversation.reload.waiting_since).to be_within(1.second).of(original_waiting_since)
       end
     end
+
+    context 'when needs reply exclusion rules are configured' do
+      let(:account) { conversation.account }
+      let(:email_inbox) { create(:inbox, :with_email, account: account) }
+      let(:contact) { create(:contact, account: account, email: 'admin@evestv.com') }
+      let(:email_conversation) { create(:conversation, account: account, inbox: email_inbox, contact: contact) }
+      let(:order_subject) { "[Evestv #1 The Best IPTV Subscription | 38K+ 4D & 8K Channels]: You've got a new order: #12252" }
+      let(:order_rule) { %([{"from":"admin@evestv.com","subject_contains":"You've got a new order:"}]) }
+
+      before { email_conversation.update(waiting_since: nil) }
+
+      it 'does not set waiting_since for a matching order notification' do
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_nil
+      end
+
+      it 'sets waiting_since for a contact form message from the same sender' do
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: 'Contact form: I need help with my subscription' } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'sets waiting_since when the sender matches but the subject does not' do
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: 'Re: order #12252, I want a refund' } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'sets waiting_since when the subject matches but the sender does not' do
+        other_contact = create(:contact, account: account, email: 'customer@example.com')
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          message = create(:message, account: account, conversation: email_conversation, sender: other_contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'matches the sender and the subject case insensitively' do
+        rule = %([{"from":"ADMIN@EVESTV.COM","subject_contains":"YOU'VE GOT A NEW ORDER:"}])
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rule do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_nil
+      end
+
+      it 'trims surrounding whitespace on both the rule and the message' do
+        rule = %([{"from":"  admin@evestv.com  ","subject_contains":"  You've got a new order:  "}])
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rule do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: "  #{order_subject}  " } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_nil
+      end
+
+      it 'supports multiple rules in the configured array' do
+        rule = %([{"from":"billing@example.com","subject_contains":"Invoice"},) +
+               %({"from":"admin@evestv.com","subject_contains":"You've got a new order:"}])
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rule do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_nil
+      end
+
+      it 'keeps the existing behaviour when the environment variable is missing' do
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: nil do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'keeps the existing behaviour when the configuration is not valid JSON' do
+        message = nil
+
+        expect do
+          with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: 'admin@evestv.com' do
+            message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                       message_type: :incoming, content_type: :incoming_email,
+                                       content_attributes: { email: { subject: order_subject } })
+          end
+        end.not_to raise_error
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'ignores a rule that configures a sender without a subject' do
+        message = nil
+        rule = %([{"from":"admin@evestv.com"}])
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rule do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'does not clear a waiting_since that is already present' do
+        original_waiting_since = 2.hours.ago
+        email_conversation.update!(waiting_since: original_waiting_since)
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(original_waiting_since)
+      end
+
+      it 'still updates last_activity_at for an excluded order notification' do
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.last_activity_at).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'does not apply the exclusion on a non email channel' do
+        widget_conversation = create(:conversation, account: account, contact: contact)
+        widget_conversation.update(waiting_since: nil)
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+          message = create(:message, account: account, conversation: widget_conversation, sender: contact,
+                                     message_type: :incoming,
+                                     content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(widget_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+    end
   end
 
   context 'with webhook_data' do
