@@ -57,7 +57,12 @@ describe('#mutations', () => {
       });
 
       expect(state.allConversations).toEqual([
-        { id: 1, meta: {}, last_activity_at: 1602256198 },
+        {
+          id: 1,
+          meta: {},
+          last_activity_at: 1602256198,
+          timestamp: 1602256198,
+        },
       ]);
     });
   });
@@ -137,7 +142,7 @@ describe('#mutations', () => {
               created_at: 1602256198,
             },
           ],
-          unread_count: 0,
+          last_activity_at: 1602256198,
           timestamp: 1602256198,
         },
       ]);
@@ -165,7 +170,7 @@ describe('#mutations', () => {
               created_at: 1602256198,
             },
           ],
-          unread_count: 0,
+          last_activity_at: 1602256198,
           timestamp: 1602256198,
         },
       ]);
@@ -204,6 +209,8 @@ describe('#mutations', () => {
               created_at: 1602256198,
             },
           ],
+          last_activity_at: 1602256198,
+          timestamp: 1602256198,
         },
       ]);
       expect(emitter.emit).not.toHaveBeenCalled();
@@ -333,7 +340,9 @@ describe('#mutations', () => {
         {
           id: 1,
           name: 'test',
-          messages: [{ id: 1, content: 'test' }],
+          // merged by id: the loaded thread is kept and the overlapping message is refreshed
+          // from the newer server payload, never replaced wholesale or truncated
+          messages: [{ id: 1, content: 'updated message' }],
           dataFetched: true,
           allMessagesLoaded: true,
         },
@@ -830,7 +839,7 @@ describe('#mutations', () => {
       });
     });
 
-    it('should add conversation if not found on normal view', () => {
+    it('does not insert an absent conversation on a normal view', () => {
       const state = {
         allConversations: [],
         conversationFilters: {},
@@ -842,7 +851,9 @@ describe('#mutations', () => {
       };
 
       mutations[types.UPDATE_CONVERSATION](state, conversation);
-      expect(state.allConversations).toEqual([conversation]);
+      // Security invariant: an ActionCable payload may never create an unknown conversation.
+      // Insertion belongs to the authorized fetch path only.
+      expect(state.allConversations).toEqual([]);
     });
 
     it('should not add conversation if not found on participating view', () => {
@@ -875,19 +886,14 @@ describe('#mutations', () => {
       expect(state.allConversations).toEqual([]);
     });
 
-    it('should add conversation if not found on unattended view', () => {
+    it('does not insert an absent conversation on an unattended view', () => {
       const state = {
         allConversations: [],
         conversationFilters: { conversationType: 'unattended' },
       };
 
-      const conversation = {
-        id: 1,
-        status: 'open',
-      };
-
-      mutations[types.UPDATE_CONVERSATION](state, conversation);
-      expect(state.allConversations).toEqual([conversation]);
+      mutations[types.UPDATE_CONVERSATION](state, { id: 1, status: 'open' });
+      expect(state.allConversations).toEqual([]);
     });
 
     it('should emit events if updating selected conversation', () => {
@@ -1055,28 +1061,6 @@ describe('#mutations', () => {
     });
   });
 
-  describe('#ADD_CONVERSATION', () => {
-    it('should add a new conversation', () => {
-      const state = {
-        allConversations: [],
-      };
-
-      const conversation = { id: 1, messages: [] };
-      mutations[types.ADD_CONVERSATION](state, conversation);
-      expect(state.allConversations).toEqual([conversation]);
-    });
-
-    it('should not add a duplicate conversation', () => {
-      const conversation = { id: 1, messages: [] };
-      const state = {
-        allConversations: [conversation],
-      };
-
-      mutations[types.ADD_CONVERSATION](state, { id: 1, messages: [] });
-      expect(state.allConversations).toHaveLength(1);
-    });
-  });
-
   describe('#DELETE_CONVERSATION', () => {
     it('should delete a conversation', () => {
       const state = {
@@ -1150,5 +1134,404 @@ describe('#mutations', () => {
 
       expect(state.syncConversationsMessages[1]).toBe(100);
     });
+  });
+});
+
+describe('#mutations - Phase 2A realtime contract', () => {
+  describe('#ADD_MESSAGE ordering and activity', () => {
+    it('orders out-of-order arrivals and keeps the newest as the preview', () => {
+      const state = {
+        allConversations: [{ id: 1, messages: [], last_activity_at: 0 }],
+        selectedChatId: -1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 102,
+        conversation_id: 1,
+        created_at: 1200,
+        conversation: { last_activity_at: 1200 },
+      });
+      mutations[types.ADD_MESSAGE](state, {
+        id: 101,
+        conversation_id: 1,
+        created_at: 1100,
+        conversation: { last_activity_at: 1100 },
+      });
+
+      const chat = state.allConversations[0];
+      expect(chat.messages.map(m => m.id)).toEqual([101, 102]);
+      expect(chat.messages[chat.messages.length - 1].id).toBe(102);
+      expect(chat.last_activity_at).toBe(1200);
+      expect(chat.timestamp).toBe(1200);
+    });
+
+    it('never regresses activity when an older message arrives late', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            messages: [{ id: 102, created_at: 1200 }],
+            last_activity_at: 1200,
+          },
+        ],
+        selectedChatId: -1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 101,
+        conversation_id: 1,
+        created_at: 1100,
+        conversation: { last_activity_at: 1100 },
+      });
+      expect(state.allConversations[0].last_activity_at).toBe(1200);
+    });
+
+    it('does not let an older duplicate overwrite the newest unread count', () => {
+      const state = {
+        allConversations: [{ id: 1, messages: [], last_activity_at: 0 }],
+        selectedChatId: -1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 102,
+        conversation_id: 1,
+        created_at: 1200,
+        message_type: 0,
+        conversation: { last_activity_at: 1200, unread_count: 7 },
+      });
+      mutations[types.ADD_MESSAGE](state, {
+        id: 101,
+        conversation_id: 1,
+        created_at: 1100,
+        message_type: 0,
+        conversation: { last_activity_at: 1100, unread_count: 1 },
+      });
+      expect(state.allConversations[0].unread_count).toBe(7);
+    });
+
+    it('leaves activity, timestamp and unread untouched for an optimistic message', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            messages: [],
+            last_activity_at: 500,
+            timestamp: 500,
+            unread_count: 4,
+          },
+        ],
+        selectedChatId: 1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 'uuid-1',
+        echo_id: 'uuid-1',
+        status: 'progress',
+        conversation_id: 1,
+        created_at: 9999,
+        message_type: 1,
+      });
+      const chat = state.allConversations[0];
+      expect(chat.messages).toHaveLength(1);
+      expect(chat.last_activity_at).toBe(500);
+      expect(chat.timestamp).toBe(500);
+      expect(chat.unread_count).toBe(4);
+    });
+
+    it('trims a non-selected row to five messages without implying completeness', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            messages: [1, 2, 3, 4, 5].map(id => ({ id, created_at: id })),
+            last_activity_at: 0,
+          },
+        ],
+        selectedChatId: -1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 6,
+        conversation_id: 1,
+        created_at: 6,
+      });
+      const chat = state.allConversations[0];
+      expect(chat.messages).toHaveLength(5);
+      expect(chat.messages.map(m => m.id)).toEqual([2, 3, 4, 5, 6]);
+      expect(chat.allMessagesLoaded).toBeUndefined();
+      expect(chat.dataFetched).toBeUndefined();
+    });
+
+    it('never trims the selected conversation', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            messages: [1, 2, 3, 4, 5].map(id => ({ id, created_at: id })),
+            last_activity_at: 0,
+          },
+        ],
+        selectedChatId: 1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 6,
+        conversation_id: 1,
+        created_at: 6,
+      });
+      expect(state.allConversations[0].messages).toHaveLength(6);
+    });
+  });
+
+  describe('#ADD_MESSAGE incomingVersion collision signal', () => {
+    const baseState = () => ({
+      allConversations: [{ id: 1, messages: [], last_activity_at: 0 }],
+      selectedChatId: -1,
+    });
+
+    it('increments for a genuinely new incoming public message', () => {
+      const state = baseState();
+      mutations[types.ADD_MESSAGE](state, {
+        id: 1,
+        conversation_id: 1,
+        created_at: 10,
+        message_type: 0,
+      });
+      expect(state.allConversations[0].incomingVersion).toBe(1);
+    });
+
+    it('does not increment for a duplicate cable event', () => {
+      const state = baseState();
+      const message = {
+        id: 1,
+        conversation_id: 1,
+        created_at: 10,
+        message_type: 0,
+      };
+      mutations[types.ADD_MESSAGE](state, message);
+      mutations[types.ADD_MESSAGE](state, message);
+      expect(state.allConversations[0].incomingVersion).toBe(1);
+    });
+
+    it('does not increment when a pending uuid is replaced by its server message', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            last_activity_at: 0,
+            messages: [
+              {
+                id: 'uuid-1',
+                echo_id: 'uuid-1',
+                status: 'progress',
+                created_at: 10,
+                message_type: 0,
+              },
+            ],
+          },
+        ],
+        selectedChatId: -1,
+      };
+      mutations[types.ADD_MESSAGE](state, {
+        id: 500,
+        echo_id: 'uuid-1',
+        conversation_id: 1,
+        created_at: 10,
+        message_type: 0,
+        conversation: { unread_count: 9 },
+      });
+      const chat = state.allConversations[0];
+      expect(chat.messages).toHaveLength(1);
+      expect(chat.messages[0].id).toBe(500);
+      // a replacement is not a genuinely new message
+      expect(chat.incomingVersion).toBeUndefined();
+      expect(chat.unread_count).toBeUndefined();
+    });
+
+    it('does not increment for outgoing, private or pending messages', () => {
+      const state = baseState();
+      mutations[types.ADD_MESSAGE](state, {
+        id: 1,
+        conversation_id: 1,
+        created_at: 10,
+        message_type: 1,
+      });
+      mutations[types.ADD_MESSAGE](state, {
+        id: 2,
+        conversation_id: 1,
+        created_at: 11,
+        message_type: 0,
+        private: true,
+      });
+      mutations[types.ADD_MESSAGE](state, {
+        id: 'uuid-1',
+        echo_id: 'uuid-1',
+        status: 'progress',
+        conversation_id: 1,
+        created_at: 12,
+        message_type: 0,
+      });
+      expect(state.allConversations[0].incomingVersion).toBeUndefined();
+    });
+  });
+
+  describe('#UPDATE_CONVERSATION tail-only message merge', () => {
+    it('does not punch an older payload message into a loaded thread', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            updated_at: 1,
+            last_activity_at: 300,
+            allMessagesLoaded: true,
+            dataFetched: true,
+            messages: [
+              { id: 100, created_at: 100 },
+              { id: 200, created_at: 200 },
+            ],
+          },
+        ],
+        selectedChatId: 1,
+      };
+      mutations[types.UPDATE_CONVERSATION](state, {
+        id: 1,
+        updated_at: 2,
+        messages: [{ id: 150, created_at: 150 }],
+      });
+      const chat = state.allConversations[0];
+      expect(chat.messages.map(m => m.id)).toEqual([100, 200]);
+      expect(chat.allMessagesLoaded).toBe(true);
+      expect(chat.dataFetched).toBe(true);
+    });
+
+    it('accepts a payload message that is newer than everything loaded', () => {
+      const state = {
+        allConversations: [
+          {
+            id: 1,
+            updated_at: 1,
+            last_activity_at: 200,
+            messages: [{ id: 200, created_at: 200 }],
+          },
+        ],
+        selectedChatId: 1,
+      };
+      mutations[types.UPDATE_CONVERSATION](state, {
+        id: 1,
+        updated_at: 2,
+        last_activity_at: 300,
+        messages: [{ id: 300, created_at: 300 }],
+      });
+      const chat = state.allConversations[0];
+      expect(chat.messages.map(m => m.id)).toEqual([200, 300]);
+      expect(chat.last_activity_at).toBe(300);
+      expect(chat.timestamp).toBe(300);
+    });
+
+    it('keeps activity monotonic against an older payload', () => {
+      const state = {
+        allConversations: [{ id: 1, updated_at: 1, last_activity_at: 500 }],
+        selectedChatId: -1,
+      };
+      mutations[types.UPDATE_CONVERSATION](state, {
+        id: 1,
+        updated_at: 2,
+        last_activity_at: 100,
+      });
+      expect(state.allConversations[0].last_activity_at).toBe(500);
+    });
+  });
+
+  describe('#UPSERT_CONVERSATION', () => {
+    it('inserts an API-authorized conversation that is absent', () => {
+      const state = { allConversations: [], selectedChatId: null };
+      mutations[types.UPSERT_CONVERSATION](state, {
+        id: 5,
+        last_activity_at: 9,
+      });
+      expect(state.allConversations).toHaveLength(1);
+      expect(state.allConversations[0].id).toBe(5);
+    });
+
+    it('merges under the freshness rules when already present', () => {
+      const state = {
+        allConversations: [
+          { id: 5, last_activity_at: 900, updated_at: 900, messages: [] },
+        ],
+        selectedChatId: null,
+      };
+      mutations[types.UPSERT_CONVERSATION](state, {
+        id: 5,
+        last_activity_at: 100,
+        updated_at: 100,
+        messages: [],
+      });
+      expect(state.allConversations).toHaveLength(1);
+      expect(state.allConversations[0].last_activity_at).toBe(900);
+    });
+  });
+});
+
+describe('#ADD_MESSAGE unread freshness with an optimistic tail', () => {
+  // mergeMessagesById deliberately parks optimistic uuid rows AFTER every server message and
+  // never sorts them, because their created_at comes from the browser clock. Unread freshness
+  // must therefore be judged against the newest SERVER message, not the array tail.
+  const stateWithOptimisticTail = clockSkew => ({
+    allConversations: [
+      {
+        id: 1,
+        last_activity_at: 1000,
+        timestamp: 1000,
+        unread_count: 0,
+        messages: [
+          { id: 100, created_at: 1000, message_type: 0 },
+          {
+            id: 'uuid-out',
+            echo_id: 'uuid-out',
+            status: 'progress',
+            created_at: clockSkew,
+            message_type: 1,
+          },
+        ],
+      },
+    ],
+    selectedChatId: -1,
+  });
+
+  it.each([
+    ['ahead of the server', 99999],
+    ['behind the server', 1],
+  ])(
+    'applies the incoming unread count when the browser clock is %s',
+    (_label, clockSkew) => {
+      const state = stateWithOptimisticTail(clockSkew);
+
+      mutations[types.ADD_MESSAGE](state, {
+        id: 101,
+        conversation_id: 1,
+        created_at: 1001,
+        message_type: 0,
+        conversation: { last_activity_at: 1001, unread_count: 3 },
+      });
+
+      const chat = state.allConversations[0];
+      expect(chat.unread_count).toBe(3);
+      expect(chat.incomingVersion).toBe(1);
+      expect(chat.last_activity_at).toBe(1001);
+      // the optimistic row is still parked at the tail, in insertion order
+      expect(chat.messages[chat.messages.length - 1].id).toBe('uuid-out');
+      expect(chat.messages.map(m => m.id)).toEqual([100, 101, 'uuid-out']);
+    }
+  );
+
+  it('still ignores a genuinely older server message despite the optimistic tail', () => {
+    const state = stateWithOptimisticTail(99999);
+    state.allConversations[0].unread_count = 5;
+
+    mutations[types.ADD_MESSAGE](state, {
+      id: 99,
+      conversation_id: 1,
+      created_at: 999,
+      message_type: 0,
+      conversation: { last_activity_at: 999, unread_count: 1 },
+    });
+
+    const chat = state.allConversations[0];
+    expect(chat.unread_count).toBe(5);
+    expect(chat.incomingVersion).toBeUndefined();
   });
 });

@@ -125,8 +125,14 @@ const getSortOrderFunction = sortOrder =>
   sortOrder === 'asc' ? sortAscending : sortDescending;
 
 const sortConfig = {
-  sortOnLastActivityAt: (a, b, sortDirection) =>
-    getSortOrderFunction(sortDirection)(a.last_activity_at, b.last_activity_at),
+  sortOnLastActivityAt: (a, b, sortDirection) => {
+    const sortFunc = getSortOrderFunction(sortDirection);
+    const activityDiff = sortFunc(a.last_activity_at, b.last_activity_at);
+    // Whole-second timestamps collide constantly, and a stable sort would then freeze the
+    // incumbent on top. Break the tie on id in the same direction the server orders by.
+    if (activityDiff !== 0) return activityDiff;
+    return sortFunc(a.id, b.id);
+  },
 
   sortOnCreatedAt: (a, b, sortDirection) =>
     getSortOrderFunction(sortDirection)(a.created_at, b.created_at),
@@ -165,4 +171,144 @@ export const sortComparator = (a, b, sortKey) => {
   const [sortMethod, sortDirection] =
     SORT_OPTIONS[sortKey] || SORT_OPTIONS.last_activity_at_desc;
   return sortConfig[sortMethod](a, b, sortDirection);
+};
+
+export const compareByLastActivityDesc = (a, b) =>
+  sortComparator(a, b, 'last_activity_at_desc');
+
+// Messages that list rows keep. The list only ever renders the newest non-activity message.
+export const LIST_MESSAGE_KEEP_COUNT = 5;
+
+export const isNumericMessageId = id => id !== null && /^\d+$/.test(String(id));
+
+/**
+ * Orders message identities. Server ids are numeric and ascend with creation. Optimistic
+ * messages carry a uuid until the server echo reconciles them, and must sort after every
+ * server message.
+ */
+export const compareMessageId = (a, b) => {
+  const aNumeric = isNumericMessageId(a);
+  const bNumeric = isNumericMessageId(b);
+  if (aNumeric && bNumeric) return Number(a) - Number(b);
+  if (aNumeric) return -1;
+  if (bNumeric) return 1;
+  return String(a).localeCompare(String(b));
+};
+
+export const compareMessages = (a, b) => {
+  const createdAtDiff = Number(a.created_at ?? 0) - Number(b.created_at ?? 0);
+  // Same-second messages are common, so created_at alone is not an ordering.
+  if (createdAtDiff !== 0) return createdAtDiff;
+  return compareMessageId(a.id, b.id);
+};
+
+export const isNewerMessage = (message, latest) => {
+  if (!latest) return true;
+  return compareMessages(message, latest) > 0;
+};
+
+const isOptimisticMessage = message => !isNumericMessageId(message?.id);
+
+/**
+ * Merges incoming messages into an existing array, deduplicated by message identity and
+ * ordered deterministically. ActionCable delivers each broadcast as its own job, so arrival
+ * order is never creation order.
+ *
+ * Identity resolution reuses findPendingMessageIndex so the pending-replacement rule cannot
+ * drift, and additionally matches an existing pending row by its echo_id. Incoming server
+ * data always wins a collision, which drops the stale uuid identity.
+ */
+/**
+ * The single message-identity rule. Built on findPendingMessageIndex so the pending
+ * replacement semantics have exactly one definition and cannot drift between the merge and
+ * the mutation that decides whether a message is genuinely new.
+ */
+export const findMessageIndexByIdentity = (messages, message) => {
+  const pendingIndex = findPendingMessageIndex({ messages }, message);
+  if (pendingIndex !== -1) return pendingIndex;
+  return messages.findIndex(
+    m =>
+      m.echo_id && (m.echo_id === message.id || m.echo_id === message.echo_id)
+  );
+};
+
+export const mergeMessagesById = (
+  existing = [],
+  incoming = [],
+  { keep } = {}
+) => {
+  const merged = [...existing];
+
+  incoming.filter(Boolean).forEach(message => {
+    const index = findMessageIndexByIdentity(merged, message);
+    if (index === -1) {
+      merged.push(message);
+    } else {
+      merged[index] = message;
+    }
+  });
+
+  // Optimistic rows are ordered by the browser clock, which is not server truth, so they are
+  // never sorted - they stay in insertion order after every server message.
+  const serverMessages = merged.filter(m => !isOptimisticMessage(m));
+  const optimisticMessages = merged.filter(isOptimisticMessage);
+  const ordered = [
+    ...serverMessages.sort(compareMessages),
+    ...optimisticMessages,
+  ];
+
+  if (keep && ordered.length > keep) return ordered.slice(-keep);
+  return ordered;
+};
+
+/**
+ * Three-way merge used when a page response meets an entity the realtime pipeline already
+ * advanced. Activity never decreases (I1) and the selected chat never loses its loaded
+ * history or its completeness flags.
+ */
+export const mergeConversation = (
+  existing,
+  incoming,
+  { isSelected = false } = {}
+) => {
+  const keep = isSelected ? undefined : LIST_MESSAGE_KEEP_COUNT;
+  const existingActivity = Number(existing.last_activity_at ?? 0);
+  const incomingActivity = Number(incoming.last_activity_at ?? 0);
+
+  let base;
+  if (incomingActivity < existingActivity) {
+    // The local entity is fresher than the snapshot; keep it.
+    base = { ...existing };
+  } else if (incomingActivity > existingActivity) {
+    base = { ...existing, ...incoming };
+  } else {
+    const existingUpdatedAt = Number(existing.updated_at ?? 0);
+    const incomingUpdatedAt = Number(incoming.updated_at ?? 0);
+    base =
+      incomingUpdatedAt >= existingUpdatedAt
+        ? { ...existing, ...incoming }
+        : { ...incoming, ...existing };
+  }
+
+  const merged = { ...base };
+
+  if (existing.messages || incoming.messages) {
+    merged.messages = mergeMessagesById(existing.messages, incoming.messages, {
+      keep,
+    });
+  }
+
+  // History-completeness flags are local state, never carried by a snapshot, and trimming a
+  // list row must never imply the thread is fully loaded.
+  ['allMessagesLoaded', 'dataFetched'].forEach(flag => {
+    if (existing[flag] === undefined) delete merged[flag];
+    else merged[flag] = existing[flag];
+  });
+
+  const lastActivityAt = Math.max(existingActivity, incomingActivity);
+  if (lastActivityAt) {
+    merged.last_activity_at = lastActivityAt;
+    merged.timestamp = lastActivityAt;
+  }
+  return merged;
 };

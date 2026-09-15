@@ -1,8 +1,15 @@
 import types from '../../mutation-types';
 import getters, { getSelectedChatConversation } from './getters';
 import actions from './actions';
-import { findPendingMessageIndex } from './helpers';
-import { MESSAGE_STATUS } from 'shared/constants/messages';
+import {
+  findMessageIndexByIdentity,
+  isNewerMessage,
+  isNumericMessageId,
+  mergeConversation,
+  mergeMessagesById,
+  LIST_MESSAGE_KEEP_COUNT,
+} from './helpers';
+import { MESSAGE_STATUS, MESSAGE_TYPE } from 'shared/constants/messages';
 import wootConstants from 'dashboard/constants/globals';
 import { BUS_EVENTS } from '../../../../shared/constants/busEvents';
 import { emitter } from 'shared/helpers/mitt';
@@ -39,22 +46,14 @@ export const mutations = {
       );
       if (indexInCurrentList < 0) {
         newAllConversations.push(conversation);
-      } else if (conversation.id !== _state.selectedChatId) {
-        // If the conversation is already in the list, replace it
-        // Added this to fix the issue of the conversation not being updated
-        // When reconnecting to the websocket. If the selectedChatId is not the same as
-        // the conversation.id in the store, replace the existing conversation with the new one
-        newAllConversations[indexInCurrentList] = conversation;
       } else {
-        // If the conversation is already in the list and selectedChatId is the same,
-        // replace all data except the messages array, attachments, dataFetched, allMessagesLoaded
-        const existingConversation = newAllConversations[indexInCurrentList];
-        newAllConversations[indexInCurrentList] = {
-          ...conversation,
-          allMessagesLoaded: existingConversation.allMessagesLoaded,
-          messages: existingConversation.messages,
-          dataFetched: existingConversation.dataFetched,
-        };
+        // A page response can be older than realtime state that already landed, so the merge
+        // decides per field instead of replacing wholesale.
+        newAllConversations[indexInCurrentList] = mergeConversation(
+          newAllConversations[indexInCurrentList],
+          conversation,
+          { isSelected: conversation.id === _state.selectedChatId }
+        );
       }
     });
     _state.allConversations = newAllConversations;
@@ -128,9 +127,15 @@ export const mutations = {
     { lastActivityAt, conversationId }
   ) {
     const [chat] = _state.allConversations.filter(c => c.id === conversationId);
-    if (chat) {
-      chat.last_activity_at = lastActivityAt;
-    }
+    if (!chat) return;
+    // Broadcasts are independent jobs with no ordering guarantee, so activity only ever rises.
+    const nextActivity = Math.max(
+      Number(chat.last_activity_at ?? 0),
+      Number(lastActivityAt ?? 0)
+    );
+    if (!nextActivity) return;
+    chat.last_activity_at = nextActivity;
+    chat.timestamp = nextActivity;
   },
   [types.ASSIGN_PRIORITY](_state, { priority, conversationId }) {
     const [chat] = _state.allConversations.filter(c => c.id === conversationId);
@@ -214,26 +219,65 @@ export const mutations = {
       allConversations,
       selectedChatId: conversationId,
     });
+    // An unknown conversation is never created here. The authorized fetch path owns insertion.
     if (!chat) return;
 
-    const pendingMessageIndex = findPendingMessageIndex(chat, message);
-    if (pendingMessageIndex !== -1) {
-      chat.messages[pendingMessageIndex] = message;
-    } else {
-      chat.messages.push(message);
-      chat.timestamp = message.created_at;
-      const { conversation: { unread_count: unreadCount = 0 } = {} } = message;
-      chat.unread_count = unreadCount;
-      if (selectedChatId === conversationId) {
-        emitter.emit(BUS_EVENTS.SCROLL_TO_MESSAGE);
-      }
-    }
-  },
+    const existingMessages = chat.messages || [];
+    // mergeMessagesById parks optimistic uuid rows after every server message and never sorts
+    // them, so the array tail can be an optimistic row timed by the browser clock. Unread
+    // freshness is judged against the newest SERVER message, otherwise a clock running ahead
+    // would suppress the unread count of a genuinely new customer message.
+    const serverMessages = existingMessages.filter(m =>
+      isNumericMessageId(m.id)
+    );
+    const latest = serverMessages[serverMessages.length - 1];
+    const alreadyKnown =
+      findMessageIndexByIdentity(existingMessages, message) !== -1;
+    const isPending =
+      message.status === MESSAGE_STATUS.PROGRESS &&
+      message.id === message.echo_id;
+    const keep =
+      chat.id === selectedChatId ? undefined : LIST_MESSAGE_KEEP_COUNT;
 
-  [types.ADD_CONVERSATION](_state, conversation) {
-    const exists = _state.allConversations.some(c => c.id === conversation.id);
-    if (!exists) {
-      _state.allConversations.push(conversation);
+    chat.messages = mergeMessagesById(existingMessages, [message], { keep });
+
+    if (!alreadyKnown && selectedChatId === conversationId) {
+      emitter.emit(BUS_EVENTS.SCROLL_TO_MESSAGE);
+    }
+
+    // An optimistic row is timed by the browser clock, which is not server truth.
+    if (isPending) return;
+
+    const activity = Number(
+      message.conversation?.last_activity_at ?? message.created_at ?? 0
+    );
+    const nextActivity = Math.max(Number(chat.last_activity_at ?? 0), activity);
+    if (nextActivity) {
+      chat.last_activity_at = nextActivity;
+      chat.timestamp = nextActivity;
+    }
+
+    const isGenuinelyNew = !alreadyKnown && isNewerMessage(message, latest);
+
+    // Collision signal consumed by the Phase 2D read-state reconciliation. It must count only
+    // genuinely new incoming public messages - never duplicates, replacements, pending rows,
+    // outgoing messages or private notes.
+    if (
+      isGenuinelyNew &&
+      message.message_type === MESSAGE_TYPE.INCOMING &&
+      !message.private
+    ) {
+      chat.incomingVersion = (chat.incomingVersion ?? 0) + 1;
+    }
+
+    // Unread is never derived arithmetically. Accept the server's count only when this really
+    // is the newest message, so a late or duplicate event cannot resurrect a stale count.
+    if (
+      isGenuinelyNew &&
+      message.conversation &&
+      'unread_count' in message.conversation
+    ) {
+      chat.unread_count = message.conversation.unread_count;
     }
   },
 
@@ -247,26 +291,74 @@ export const mutations = {
     const { allConversations } = _state;
     const index = allConversations.findIndex(c => c.id === conversation.id);
 
-    if (index > -1) {
-      const selectedConversation = allConversations[index];
+    // Update only. An ActionCable payload may never create an unknown conversation - that is
+    // the job of ensureAuthorizedConversation, which authorizes through the API first. The old
+    // push-when-absent branch and its mention/participating gate are gone with it.
+    if (index < 0) return;
 
-      // ignore out of order events
-      if (conversation.updated_at < selectedConversation.updated_at) {
-        return;
-      }
+    const existing = allConversations[index];
 
-      const { messages, ...updates } = conversation;
-      allConversations[index] = { ...selectedConversation, ...updates };
-      if (_state.selectedChatId === conversation.id) {
-        emitter.emit(BUS_EVENTS.SCROLL_TO_MESSAGE);
-      }
-    } else {
-      const { conversationType } = _state.conversationFilters || {};
-      const { MENTION, PARTICIPATING } = wootConstants.CONVERSATION_TYPE;
-      if (![MENTION, PARTICIPATING].includes(conversationType)) {
-        _state.allConversations.push(conversation);
-      }
+    // ignore out of order events
+    if (conversation.updated_at < existing.updated_at) {
+      return;
     }
+
+    const { messages: payloadMessages = [], ...updates } = conversation;
+    const merged = { ...existing, ...updates };
+
+    // Tail-only merge: a conversation payload carries just the last public message, so accept
+    // it only when it is newer than everything loaded. Never punch a hole into an open thread,
+    // and never imply the history is complete.
+    const existingMessages = existing.messages || [];
+    const maxNumericId = existingMessages.reduce(
+      (max, m) =>
+        isNumericMessageId(m.id) && Number(m.id) > max ? Number(m.id) : max,
+      0
+    );
+    const tailMessages = payloadMessages.filter(
+      m => isNumericMessageId(m.id) && Number(m.id) > maxNumericId
+    );
+    const keep =
+      conversation.id === _state.selectedChatId
+        ? undefined
+        : LIST_MESSAGE_KEEP_COUNT;
+    merged.messages = tailMessages.length
+      ? mergeMessagesById(existingMessages, tailMessages, { keep })
+      : existingMessages;
+    merged.allMessagesLoaded = existing.allMessagesLoaded;
+    merged.dataFetched = existing.dataFetched;
+
+    const nextActivity = Math.max(
+      Number(existing.last_activity_at ?? 0),
+      Number(conversation.last_activity_at ?? 0)
+    );
+    if (nextActivity) {
+      merged.last_activity_at = nextActivity;
+      merged.timestamp = nextActivity;
+    }
+
+    allConversations[index] = merged;
+    if (_state.selectedChatId === conversation.id) {
+      emitter.emit(BUS_EVENTS.SCROLL_TO_MESSAGE);
+    }
+  },
+
+  [types.UPSERT_CONVERSATION](_state, conversation) {
+    // The only realtime insertion path. Reached exclusively from upsertFetchedConversation,
+    // whose payload came from an authenticated ConversationApi.show. No LRU eviction: a row
+    // here may equally belong to a page the agent has already scrolled through.
+    const index = _state.allConversations.findIndex(
+      c => c.id === conversation.id
+    );
+    if (index < 0) {
+      _state.allConversations.push(conversation);
+      return;
+    }
+    _state.allConversations[index] = mergeConversation(
+      _state.allConversations[index],
+      conversation,
+      { isSelected: conversation.id === _state.selectedChatId }
+    );
   },
 
   [types.SET_LIST_LOADING_STATUS](_state) {

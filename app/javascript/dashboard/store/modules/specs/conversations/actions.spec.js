@@ -14,6 +14,12 @@ const dataToSend = {
   ],
 };
 import { dataReceived } from './testConversationResponse';
+import {
+  inflightFetches,
+  realtimeKey,
+  resetRealtimeState,
+  DEBOUNCE_MS,
+} from '../../conversations/realtimeState';
 
 const commit = vi.fn();
 const dispatch = vi.fn();
@@ -61,19 +67,21 @@ describe('#actions', () => {
       axios.get.mockResolvedValue({
         data: { id: 1, meta: { sender: { id: 1, name: 'Contact 1' } } },
       });
-      await actions.getConversation({ commit }, 1);
-      expect(commit.mock.calls).toEqual([
+      const localDispatch = vi.fn();
+      await actions.getConversation({ commit, dispatch: localDispatch }, 1);
+      // Deep links insert through the same authorized upsert helper as the realtime path.
+      expect(localDispatch.mock.calls).toEqual([
         [
-          types.UPDATE_CONVERSATION,
+          'upsertFetchedConversation',
           { id: 1, meta: { sender: { id: 1, name: 'Contact 1' } } },
         ],
-        ['contacts/SET_CONTACT_ITEM', { id: 1, name: 'Contact 1' }],
       ]);
     });
     it('sends correct actions if API is error', async () => {
       axios.get.mockRejectedValue({ message: 'Incorrect header' });
-      await actions.getConversation({ commit });
-      expect(commit.mock.calls).toEqual([]);
+      const localDispatch = vi.fn();
+      await actions.getConversation({ commit, dispatch: localDispatch });
+      expect(localDispatch.mock.calls).toEqual([]);
     });
   });
   describe('#muteConversation', () => {
@@ -109,148 +117,6 @@ describe('#actions', () => {
           'conversationLabels/setConversationLabel',
           { id: 1, data: ['support'] },
         ],
-        [
-          'contacts/setContact',
-          {
-            id: 1,
-            name: 'john-doe',
-          },
-        ],
-      ]);
-    });
-  });
-
-  describe('#addConversation', () => {
-    it('doesnot send mutation if conversation is from a different inbox', () => {
-      const conversation = {
-        id: 1,
-        messages: [],
-        meta: { sender: { id: 1, name: 'john-doe' } },
-        inbox_id: 2,
-      };
-      actions.addConversation(
-        {
-          commit,
-          rootState: { route: { name: 'home' } },
-          dispatch,
-          state: { currentInbox: 1, appliedFilters: [] },
-        },
-        conversation
-      );
-      expect(commit.mock.calls).toEqual([]);
-      expect(dispatch.mock.calls).toEqual([]);
-    });
-
-    it('doesnot send mutation if conversation filters are applied', () => {
-      const conversation = {
-        id: 1,
-        messages: [],
-        meta: { sender: { id: 1, name: 'john-doe' } },
-        inbox_id: 1,
-      };
-      actions.addConversation(
-        {
-          commit,
-          rootState: { route: { name: 'home' } },
-          dispatch,
-          state: { currentInbox: 1, appliedFilters: [{ id: 'random-filter' }] },
-        },
-        conversation
-      );
-      expect(commit.mock.calls).toEqual([]);
-      expect(dispatch.mock.calls).toEqual([]);
-    });
-
-    it('doesnot send mutation if the view is conversation mentions', () => {
-      const conversation = {
-        id: 1,
-        messages: [],
-        meta: { sender: { id: 1, name: 'john-doe' } },
-        inbox_id: 1,
-      };
-      actions.addConversation(
-        {
-          commit,
-          rootState: { route: { name: 'conversation_mentions' } },
-          dispatch,
-          state: { currentInbox: 1, appliedFilters: [{ id: 'random-filter' }] },
-        },
-        conversation
-      );
-      expect(commit.mock.calls).toEqual([]);
-      expect(dispatch.mock.calls).toEqual([]);
-    });
-
-    it('doesnot send mutation if the view is conversation folders', () => {
-      const conversation = {
-        id: 1,
-        messages: [],
-        meta: { sender: { id: 1, name: 'john-doe' } },
-        inbox_id: 1,
-      };
-      actions.addConversation(
-        {
-          commit,
-          rootState: { route: { name: 'folder_conversations' } },
-          dispatch,
-          state: { currentInbox: 1, appliedFilters: [{ id: 'random-filter' }] },
-        },
-        conversation
-      );
-      expect(commit.mock.calls).toEqual([]);
-      expect(dispatch.mock.calls).toEqual([]);
-    });
-
-    it('sends correct mutations', () => {
-      const conversation = {
-        id: 1,
-        messages: [],
-        meta: { sender: { id: 1, name: 'john-doe' } },
-        inbox_id: 1,
-      };
-      actions.addConversation(
-        {
-          commit,
-          rootState: { route: { name: 'home' } },
-          dispatch,
-          state: { currentInbox: 1, appliedFilters: [] },
-        },
-        conversation
-      );
-      expect(commit.mock.calls).toEqual([
-        [types.ADD_CONVERSATION, conversation],
-      ]);
-      expect(dispatch.mock.calls).toEqual([
-        [
-          'contacts/setContact',
-          {
-            id: 1,
-            name: 'john-doe',
-          },
-        ],
-      ]);
-    });
-
-    it('sends correct mutations if inbox filter is not available', () => {
-      const conversation = {
-        id: 1,
-        messages: [],
-        meta: { sender: { id: 1, name: 'john-doe' } },
-        inbox_id: 1,
-      };
-      actions.addConversation(
-        {
-          commit,
-          rootState: { route: { name: 'home' } },
-          dispatch,
-          state: { appliedFilters: [] },
-        },
-        conversation
-      );
-      expect(commit.mock.calls).toEqual([
-        [types.ADD_CONVERSATION, conversation],
-      ]);
-      expect(dispatch.mock.calls).toEqual([
         [
           'contacts/setContact',
           {
@@ -816,5 +682,297 @@ describe('#addMentions', () => {
         ],
       ]);
     });
+  });
+});
+
+describe('#ensureAuthorizedConversation', () => {
+  const ACCOUNT_ID = 1;
+  let localDispatch;
+
+  const rootGettersFor = (present = null, accountId = ACCOUNT_ID) => ({
+    getCurrentAccountId: accountId,
+    getConversationById: () => present,
+  });
+
+  // Runs the 300 ms trailing debounce and lets the request promise chain settle.
+  const flush = async () => {
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    resetRealtimeState();
+    localDispatch = vi.fn();
+  });
+
+  afterEach(() => {
+    resetRealtimeState();
+    vi.useRealTimers();
+  });
+
+  it('issues exactly one authorized fetch for an unknown conversation', async () => {
+    axios.get.mockResolvedValue({ data: { id: 5, account_id: ACCOUNT_ID } });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(axios.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('collapses many events for one unknown conversation into a single fetch', async () => {
+    axios.get.mockResolvedValue({ data: { id: 5, account_id: ACCOUNT_ID } });
+    for (let i = 0; i < 10; i += 1) {
+      actions.ensureAuthorizedConversation(
+        { dispatch: localDispatch, rootGetters: rootGettersFor() },
+        { conversationId: 5, message: { id: i, conversation_id: 5 } }
+      );
+    }
+    await flush();
+    expect(axios.get).toHaveBeenCalledTimes(1);
+    // every buffered message is replayed onto the authorized copy
+    const replayed = localDispatch.mock.calls.filter(
+      c => c[0] === 'addMessage'
+    );
+    expect(replayed).toHaveLength(10);
+  });
+
+  it('upserts only through the authorized helper on success', async () => {
+    const data = { id: 5, account_id: ACCOUNT_ID, updated_at: 10 };
+    axios.get.mockResolvedValue({ data });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, conversationPayload: { id: 5, updated_at: 1 } }
+    );
+    await flush();
+    expect(localDispatch).toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      data
+    );
+    // the buffered payload is older than the fetched copy, so it is not applied
+    expect(
+      localDispatch.mock.calls.filter(c => c[0] === 'updateConversation')
+    ).toHaveLength(0);
+  });
+
+  it('applies a buffered conversation payload only when it is newer', async () => {
+    const data = { id: 5, account_id: ACCOUNT_ID, updated_at: 10 };
+    axios.get.mockResolvedValue({ data });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, conversationPayload: { id: 5, updated_at: 99 } }
+    );
+    await flush();
+    expect(localDispatch).toHaveBeenCalledWith('updateConversation', {
+      id: 5,
+      updated_at: 99,
+    });
+  });
+
+  it.each([401, 403, 404, 500])(
+    'inserts nothing when the API refuses with %i',
+    async status => {
+      axios.get.mockRejectedValue({ response: { status } });
+      actions.ensureAuthorizedConversation(
+        { dispatch: localDispatch, rootGetters: rootGettersFor() },
+        { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+      );
+      await flush();
+      expect(
+        localDispatch.mock.calls.filter(
+          c => c[0] === 'upsertFetchedConversation'
+        )
+      ).toHaveLength(0);
+    }
+  );
+
+  it('inserts nothing on a network error', async () => {
+    axios.get.mockRejectedValue(new Error('Network Error'));
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(localDispatch).not.toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      expect.anything()
+    );
+  });
+
+  it('keeps no negative cache, so a later event retries', async () => {
+    axios.get.mockRejectedValueOnce({ response: { status: 403 } });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(axios.get).toHaveBeenCalledTimes(1);
+    expect(inflightFetches.size).toBe(0);
+
+    axios.get.mockResolvedValue({ data: { id: 5, account_id: ACCOUNT_ID } });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 2, conversation_id: 5 } }
+    );
+    await flush();
+    expect(axios.get).toHaveBeenCalledTimes(2);
+    expect(localDispatch).toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      expect.objectContaining({ id: 5 })
+    );
+  });
+
+  it('discards a response whose payload belongs to another account', async () => {
+    axios.get.mockResolvedValue({ data: { id: 5, account_id: 999 } });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(localDispatch).not.toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      expect.anything()
+    );
+  });
+
+  it('discards a response after the account generation changed', async () => {
+    axios.get.mockImplementation(() => {
+      resetRealtimeState(); // account switch lands while the request is in flight
+      return Promise.resolve({ data: { id: 5, account_id: ACCOUNT_ID } });
+    });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(localDispatch).not.toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      expect.anything()
+    );
+  });
+
+  it('does not let an older settled fetch delete a newer entry for the same id', async () => {
+    const key = realtimeKey(ACCOUNT_ID, 5);
+    axios.get.mockResolvedValue({ data: { id: 5, account_id: ACCOUNT_ID } });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    const firstEntry = inflightFetches.get(key);
+
+    // a lifecycle reset invalidates the first entry, then a new event creates a second one
+    resetRealtimeState();
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 2, conversation_id: 5 } }
+    );
+    const secondEntry = inflightFetches.get(key);
+    expect(secondEntry).not.toBe(firstEntry);
+
+    await flush();
+    // the second entry owned the key and completed; the first never removed it prematurely
+    expect(localDispatch).toHaveBeenCalledWith(
+      'upsertFetchedConversation',
+      expect.objectContaining({ id: 5 })
+    );
+  });
+
+  it('replays an event that arrives while the authorized request is still running', async () => {
+    let resolveShow;
+    axios.get.mockImplementation(
+      () =>
+        new Promise(resolve => {
+          resolveShow = resolve;
+        })
+    );
+
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      {
+        conversationId: 5,
+        message: { id: 1, conversation_id: 5, created_at: 1 },
+      }
+    );
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
+    expect(axios.get).toHaveBeenCalledTimes(1);
+
+    // a second cable event lands while the request is in flight - it must merge into the same
+    // entry's buffer, not start a second fetch and not be dropped
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      {
+        conversationId: 5,
+        message: { id: 2, conversation_id: 5, created_at: 2 },
+      }
+    );
+    expect(axios.get).toHaveBeenCalledTimes(1);
+
+    resolveShow({ data: { id: 5, account_id: ACCOUNT_ID } });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const replayed = localDispatch.mock.calls
+      .filter(c => c[0] === 'addMessage')
+      .map(c => c[1].id);
+    expect(replayed).toEqual([1, 2]);
+  });
+
+  it('does not lose an event that arrives after the entry has been cleaned up', async () => {
+    axios.get.mockResolvedValue({ data: { id: 5, account_id: ACCOUNT_ID } });
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor() },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(inflightFetches.size).toBe(0);
+
+    // the conversation is now in the store, so a later event takes the ordinary update path
+    localDispatch.mockClear();
+    actions.ensureAuthorizedConversation(
+      { dispatch: localDispatch, rootGetters: rootGettersFor({ id: 5 }) },
+      { conversationId: 5, message: { id: 2, conversation_id: 5 } }
+    );
+    expect(localDispatch).toHaveBeenCalledWith('addMessage', {
+      id: 2,
+      conversation_id: 5,
+    });
+  });
+
+  it('takes the ordinary update path when the conversation is already present', async () => {
+    actions.ensureAuthorizedConversation(
+      {
+        dispatch: localDispatch,
+        rootGetters: rootGettersFor({ id: 5 }),
+      },
+      { conversationId: 5, message: { id: 1, conversation_id: 5 } }
+    );
+    await flush();
+    expect(axios.get).not.toHaveBeenCalled();
+    expect(localDispatch).toHaveBeenCalledWith('addMessage', {
+      id: 1,
+      conversation_id: 5,
+    });
+  });
+});
+
+describe('#bufferMessageUpdateIfFetching', () => {
+  beforeEach(() => {
+    resetRealtimeState();
+  });
+  afterEach(() => {
+    resetRealtimeState();
+  });
+
+  it('never starts a fetch of its own', () => {
+    vi.clearAllMocks();
+    actions.bufferMessageUpdateIfFetching(
+      { rootGetters: { getCurrentAccountId: 1 } },
+      { id: 9, conversation_id: 5 }
+    );
+    expect(axios.get).not.toHaveBeenCalled();
+    expect(inflightFetches.size).toBe(0);
   });
 });

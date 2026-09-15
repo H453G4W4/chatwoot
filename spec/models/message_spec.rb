@@ -140,7 +140,7 @@ RSpec.describe Message do
           contact_inbox: {
             source_id: message.conversation.contact_inbox.source_id
           },
-          last_activity_at: message.conversation.last_activity_at.to_i,
+          last_activity_at: message.conversation.last_activity_at.to_f,
           unread_count: message.conversation.unread_incoming_messages.count
         },
         sentiment: {},
@@ -946,6 +946,24 @@ RSpec.describe Message do
       expect([after_first, after_second]).to eq([after_first, after_second].sort)
       # (d) once both complete the row holds the maximum
       expect(after_second).to eq [first.created_at, second.created_at].max
+    end
+  end
+
+  context 'when serializing conversation activity for the realtime payload' do
+    let(:conversation) { create(:conversation) }
+    let(:sub_second) { Time.zone.parse('2024-05-05 10:00:00.654321') }
+
+    it 'preserves the fractional epoch on the nested conversation node' do
+      message = create(:message, conversation: conversation, account: conversation.account)
+      # rubocop:disable Rails/SkipsModelValidations
+      conversation.update_columns(last_activity_at: sub_second)
+      # rubocop:enable Rails/SkipsModelValidations
+      message.conversation.reload
+
+      nested = message.push_event_data[:conversation]
+
+      expect(nested[:last_activity_at]).to be_within(0.000_01).of(sub_second.to_f)
+      expect(nested[:last_activity_at]).not_to eq(sub_second.to_i)
     end
   end
 end

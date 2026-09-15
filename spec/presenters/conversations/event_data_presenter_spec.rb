@@ -25,7 +25,7 @@ RSpec.describe Conversations::EventDataPresenter do
         contact_inbox: conversation.contact_inbox,
         can_reply: conversation.can_reply?,
         channel: conversation.inbox.channel_type,
-        timestamp: conversation.last_activity_at.to_i,
+        timestamp: conversation.last_activity_at.to_f,
         snoozed_until: conversation.snoozed_until,
         custom_attributes: conversation.custom_attributes,
         first_reply_created_at: nil,
@@ -42,6 +42,28 @@ RSpec.describe Conversations::EventDataPresenter do
     it 'returns push event payload' do
       # the exceptions are the values that would be added in enterprise edition.
       expect(presenter.push_data.except(:applied_sla, :sla_events)).to include(expected_data)
+    end
+
+    context 'when last_activity_at carries a sub-second component' do
+      # The queue orders by the raw column, so the payload must serialize the same value the
+      # server ordered by. Truncating to whole seconds lets the browser disagree with the
+      # server inside one second.
+      let(:sub_second) { Time.zone.parse('2024-05-05 10:00:00.654321') }
+
+      before do
+        # rubocop:disable Rails/SkipsModelValidations
+        conversation.update_columns(last_activity_at: sub_second)
+        # rubocop:enable Rails/SkipsModelValidations
+        conversation.reload
+      end
+
+      it 'preserves the fractional epoch in last_activity_at and timestamp' do
+        data = presenter.push_data
+
+        expect(data[:last_activity_at]).to be_within(0.000_01).of(sub_second.to_f)
+        expect(data[:timestamp]).to be_within(0.000_01).of(sub_second.to_f)
+        expect(data[:last_activity_at]).not_to eq(sub_second.to_i)
+      end
     end
   end
 

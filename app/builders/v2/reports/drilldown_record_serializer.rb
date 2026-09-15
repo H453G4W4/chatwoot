@@ -73,7 +73,7 @@ class V2::Reports::DrilldownRecordSerializer
       assignee_name: conversation.assignee&.name,
       status: conversation.status,
       created_at: conversation.created_at.to_i,
-      last_activity_at: conversation.last_activity_at.to_i,
+      last_activity_at: conversation.last_activity_at.to_f,
       last_message: last_message_attributes(conversation)
     }
   end

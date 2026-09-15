@@ -6,10 +6,18 @@ import { createPendingMessage } from 'dashboard/helper/commons';
 import {
   buildConversationList,
   isOnMentionsView,
-  isOnParticipatingView,
   isOnUnattendedView,
-  isOnFoldersView,
 } from './helpers/actionHelpers';
+import { compareMessages } from './helpers';
+import {
+  bufferConversationPayload,
+  bufferMessage,
+  createInflightEntry,
+  getAccountGeneration,
+  inflightFetches,
+  realtimeKey,
+  scheduleFetch,
+} from './realtimeState';
 import messageReadActions from './actions/messageReadActions';
 import messageTranslateActions from './actions/messageTranslateActions';
 import * as Sentry from '@sentry/vue';
@@ -33,14 +41,121 @@ export const hasMessageFailedWithExternalError = pendingMessage => {
 
 // actions
 const actions = {
-  getConversation: async ({ commit }, conversationId) => {
+  getConversation: async ({ dispatch }, conversationId) => {
     try {
       const response = await ConversationApi.show(conversationId);
-      commit(types.UPDATE_CONVERSATION, response.data);
-      commit(`contacts/${types.SET_CONTACT_ITEM}`, response.data.meta.sender);
+      // Deep links insert through the same authorized upsert as the realtime fetch path.
+      // Deliberately not scheduled: this is one request per navigation, not an amplification
+      // source, and it must not be delayed by the realtime debounce.
+      dispatch('upsertFetchedConversation', response.data);
     } catch (error) {
       // Ignore error
     }
+  },
+
+  upsertFetchedConversation({ commit, dispatch }, data) {
+    commit(types.UPSERT_CONVERSATION, data);
+    const sender = data.meta?.sender;
+    if (sender) commit(`contacts/${types.SET_CONTACT_ITEM}`, sender);
+    dispatch('conversationLabels/setConversationLabel', {
+      id: data.id,
+      data: data.labels,
+    });
+  },
+
+  /**
+   * The only way a conversation the store has never seen can enter allConversations.
+   *
+   * The backend is the sole authorization authority: an ActionCable payload may update an
+   * entity that is already present, but may never create one - for any role, on any event,
+   * from any route. There is no local permission pre-check and no negative cache of refusals.
+   */
+  ensureAuthorizedConversation(
+    { dispatch, rootGetters },
+    { conversationId, message, conversationPayload }
+  ) {
+    const accountId = rootGetters.getCurrentAccountId;
+    const key = realtimeKey(accountId, conversationId);
+
+    // Present already means the API authorized it earlier; re-authorizing every event would
+    // be pointless traffic.
+    if (rootGetters.getConversationById(conversationId)) {
+      if (message) dispatch('addMessage', message);
+      else if (conversationPayload)
+        dispatch('updateConversation', conversationPayload);
+      return;
+    }
+
+    // No view gate. The route the agent happens to be on must never lose a customer message.
+    const existingEntry = inflightFetches.get(key);
+    if (existingEntry) {
+      if (message) bufferMessage(existingEntry, message);
+      bufferConversationPayload(existingEntry, conversationPayload);
+      scheduleFetch(key, existingEntry, existingEntry.runner);
+      return;
+    }
+
+    const entry = createInflightEntry(accountId);
+    if (message) bufferMessage(entry, message);
+    bufferConversationPayload(entry, conversationPayload);
+    inflightFetches.set(key, entry);
+
+    const runner = () =>
+      ConversationApi.show(conversationId)
+        .then(({ data }) => {
+          // display_id is unique only per account and ApiClient reads the account from the
+          // URL, so ownership is asserted against the entry, the payload and the store.
+          const valid =
+            inflightFetches.get(key) === entry &&
+            Number(data.account_id) === Number(entry.accountId) &&
+            Number(rootGetters.getCurrentAccountId) ===
+              Number(entry.accountId) &&
+            entry.accountGeneration === getAccountGeneration();
+          if (!valid) return;
+
+          dispatch('upsertFetchedConversation', data);
+
+          // The fetched copy is authoritative; a buffered payload applies only if newer.
+          if (
+            entry.conversationPayload &&
+            Number(entry.conversationPayload.updated_at ?? 0) >
+              Number(data.updated_at ?? 0)
+          ) {
+            dispatch('updateConversation', entry.conversationPayload);
+          }
+
+          [...entry.messageBuffer.values()]
+            .sort(compareMessages)
+            .forEach(bufferedMessage => {
+              dispatch('addMessage', bufferedMessage);
+              dispatch('updateConversationLastActivity', {
+                conversationId,
+                lastActivityAt:
+                  bufferedMessage.conversation?.last_activity_at ??
+                  bufferedMessage.created_at,
+              });
+            });
+        })
+        .catch(() => {
+          // 401/403/404/5xx/network: insert nothing, retain nothing. A later event retries.
+        })
+        .finally(() => {
+          // Only the current owner may remove the entry, so an older promise can never delete
+          // a newer entry or its buffer.
+          if (inflightFetches.get(key) === entry) inflightFetches.delete(key);
+        });
+
+    scheduleFetch(key, entry, runner);
+  },
+
+  bufferMessageUpdateIfFetching({ rootGetters }, message) {
+    const key = realtimeKey(
+      rootGetters.getCurrentAccountId,
+      message.conversation_id
+    );
+    const entry = inflightFetches.get(key);
+    // Refreshes a buffered message only; it never starts a fetch of its own.
+    if (entry) bufferMessage(entry, message);
   },
 
   fetchAllConversations: async ({ commit, state, dispatch }) => {
@@ -375,28 +490,6 @@ const actions = {
       dispatch('conversationStats/get', {}, { root: true });
     } catch (error) {
       throw new Error(error);
-    }
-  },
-
-  addConversation({ commit, state, dispatch, rootState }, conversation) {
-    const { currentInbox, appliedFilters } = state;
-    const {
-      inbox_id: inboxId,
-      meta: { sender },
-    } = conversation;
-    const hasAppliedFilters = !!appliedFilters.length;
-    const isMatchingInboxFilter =
-      !currentInbox || Number(currentInbox) === inboxId;
-    if (
-      !hasAppliedFilters &&
-      !isOnFoldersView(rootState) &&
-      !isOnMentionsView(rootState) &&
-      !isOnParticipatingView(rootState) &&
-      !isOnUnattendedView(rootState) &&
-      isMatchingInboxFilter
-    ) {
-      commit(types.ADD_CONVERSATION, conversation);
-      dispatch('contacts/setContact', sender);
     }
   },
 

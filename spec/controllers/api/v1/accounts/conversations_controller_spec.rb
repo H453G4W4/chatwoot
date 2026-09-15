@@ -99,6 +99,24 @@ RSpec.describe 'Conversations API', type: :request do
         expect(body[:data][:meta][:needs_reply_count]).to eq(1)
       end
 
+      it 'serializes conversation activity as a fractional epoch' do
+        sub_second = Time.zone.parse('2024-05-05 10:00:00.654321')
+        # rubocop:disable Rails/SkipsModelValidations
+        conversation.update_columns(last_activity_at: sub_second)
+        # rubocop:enable Rails/SkipsModelValidations
+
+        get "/api/v1/accounts/#{account.id}/conversations",
+            headers: agent.create_new_auth_token,
+            as: :json
+
+        body = JSON.parse(response.body, symbolize_names: true)
+        row = body[:data][:payload].find { |c| c[:id] == conversation.display_id }
+        # The queue orders by the raw column, so the client must compare the same value.
+        expect(row[:last_activity_at]).to be_within(0.000_01).of(sub_second.to_f)
+        expect(row[:timestamp]).to be_within(0.000_01).of(sub_second.to_f)
+        expect(row[:last_activity_at]).not_to eq(sub_second.to_i)
+      end
+
       it 'returns identical counts whether or not needs_reply is passed' do
         create(:conversation, account: account, inbox: conversation.inbox)
 

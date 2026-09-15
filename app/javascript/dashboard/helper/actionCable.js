@@ -85,6 +85,20 @@ class ActionCableConnector extends BaseActionCableConnector {
 
   onMessageUpdated = data => {
     this.app.$store.dispatch('updateMessage', data);
+    // Refreshes the buffer of an in-flight authorized fetch. Never starts one itself.
+    this.app.$store.dispatch('bufferMessageUpdateIfFetching', data);
+  };
+
+  isConversationPresent = conversationId =>
+    !!this.app.$store.getters.getConversationById(conversationId);
+
+  // A conversation the store has never seen is authorized through the API before it can be
+  // stored - for every role and every route. The payload itself never creates the entity.
+  authorizeUnknownConversation = (conversationId, conversationPayload) => {
+    this.app.$store.dispatch('ensureAuthorizedConversation', {
+      conversationId,
+      conversationPayload,
+    });
   };
 
   onPresenceUpdate = data => {
@@ -97,57 +111,87 @@ class ActionCableConnector extends BaseActionCableConnector {
   onConversationContactChange = payload => {
     const { meta = {}, id: conversationId } = payload;
     const { sender } = meta || {};
-    if (conversationId) {
+    if (!conversationId) return;
+    if (this.isConversationPresent(conversationId)) {
       this.app.$store.dispatch('updateConversationContact', {
         conversationId,
         ...sender,
       });
+    } else {
+      this.authorizeUnknownConversation(conversationId, payload);
     }
   };
 
   onAssigneeChanged = payload => {
     const { id } = payload;
     if (id) {
-      this.app.$store.dispatch('updateConversation', payload);
+      if (this.isConversationPresent(id)) {
+        this.app.$store.dispatch('updateConversation', payload);
+      } else {
+        this.authorizeUnknownConversation(id, payload);
+      }
     }
     this.fetchConversationStats();
   };
 
   onConversationCreated = data => {
-    this.app.$store.dispatch('addConversation', data);
+    if (this.isConversationPresent(data.id)) {
+      this.app.$store.dispatch('updateConversation', data);
+    } else {
+      this.authorizeUnknownConversation(data.id, data);
+    }
     this.fetchConversationStats();
   };
 
   onConversationRead = data => {
-    this.app.$store.dispatch('updateConversation', data);
+    if (this.isConversationPresent(data.id)) {
+      this.app.$store.dispatch('updateConversation', data);
+    } else {
+      this.authorizeUnknownConversation(data.id, data);
+    }
   };
 
   // eslint-disable-next-line class-methods-use-this
   onLogout = () => AuthAPI.logout();
 
   onMessageCreated = data => {
-    const {
-      conversation: { last_activity_at: lastActivityAt },
-      conversation_id: conversationId,
-    } = data;
+    // message.created is the only event a buried conversation reliably produces, and its
+    // payload has no guaranteed conversation node, so never destructure it unguarded.
+    const conversationId = data.conversation_id;
+    const lastActivityAt = data.conversation?.last_activity_at;
     DashboardAudioNotificationHelper.onNewMessage(data);
-    this.app.$store.dispatch('addMessage', data);
-    this.app.$store.dispatch('updateConversationLastActivity', {
-      lastActivityAt,
-      conversationId,
-    });
+    if (this.isConversationPresent(conversationId)) {
+      this.app.$store.dispatch('addMessage', data);
+      this.app.$store.dispatch('updateConversationLastActivity', {
+        lastActivityAt,
+        conversationId,
+      });
+    } else {
+      this.app.$store.dispatch('ensureAuthorizedConversation', {
+        conversationId,
+        message: data,
+      });
+    }
   };
 
   // eslint-disable-next-line class-methods-use-this
   onReload = () => window.location.reload();
 
   onStatusChange = data => {
-    this.app.$store.dispatch('updateConversation', data);
+    if (this.isConversationPresent(data.id)) {
+      this.app.$store.dispatch('updateConversation', data);
+    } else {
+      this.authorizeUnknownConversation(data.id, data);
+    }
     this.fetchConversationStats();
   };
 
   onConversationUpdated = data => {
-    this.app.$store.dispatch('updateConversation', data);
+    if (this.isConversationPresent(data.id)) {
+      this.app.$store.dispatch('updateConversation', data);
+    } else {
+      this.authorizeUnknownConversation(data.id, data);
+    }
     this.fetchConversationStats();
   };
 

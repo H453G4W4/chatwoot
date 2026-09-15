@@ -6345,7 +6345,7 @@
                 "description": "Count of unread messages"
               },
               "last_activity_at": {
-                "type": "integer",
+                "type": "number",
                 "description": "Timestamp of last activity"
               },
               "contact_inbox": {

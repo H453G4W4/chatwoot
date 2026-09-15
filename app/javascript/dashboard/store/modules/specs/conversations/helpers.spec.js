@@ -5,6 +5,12 @@ import {
   filterByTeam,
   filterByLabel,
   filterByUnattended,
+  compareByLastActivityDesc,
+  compareMessageId,
+  compareMessages,
+  isNewerMessage,
+  mergeMessagesById,
+  mergeConversation,
 } from '../../conversations/helpers';
 
 const conversationList = [
@@ -170,5 +176,205 @@ describe('#filterByUnattended', () => {
   });
   it('returns true if conversation type is unattended and has first reply', () => {
     expect(filterByUnattended(true, 'mentions', 123)).toEqual(true);
+  });
+});
+
+describe('#compareByLastActivityDesc', () => {
+  it('orders by last_activity_at descending', () => {
+    const list = [
+      { id: 1, last_activity_at: 100 },
+      { id: 2, last_activity_at: 300 },
+      { id: 3, last_activity_at: 200 },
+    ];
+    expect([...list].sort(compareByLastActivityDesc).map(c => c.id)).toEqual([
+      2, 3, 1,
+    ]);
+  });
+
+  it('breaks a last_activity_at tie on id descending', () => {
+    const list = [
+      { id: 7, last_activity_at: 100 },
+      { id: 9, last_activity_at: 100 },
+      { id: 8, last_activity_at: 100 },
+    ];
+    expect([...list].sort(compareByLastActivityDesc).map(c => c.id)).toEqual([
+      9, 8, 7,
+    ]);
+  });
+
+  it('does not mutate the source array', () => {
+    const list = Object.freeze([
+      { id: 1, last_activity_at: 100 },
+      { id: 2, last_activity_at: 300 },
+    ]);
+    expect(() => [...list].sort(compareByLastActivityDesc)).not.toThrow();
+    expect(list.map(c => c.id)).toEqual([1, 2]);
+  });
+
+  it('never lets priority influence the order', () => {
+    const list = [
+      { id: 1, last_activity_at: 300, priority: 'low' },
+      { id: 2, last_activity_at: 100, priority: 'urgent' },
+    ];
+    expect([...list].sort(compareByLastActivityDesc).map(c => c.id)).toEqual([
+      1, 2,
+    ]);
+  });
+});
+
+describe('#compareMessageId', () => {
+  it('orders numeric ids ascending', () => {
+    expect(compareMessageId(101, 102)).toBeLessThan(0);
+  });
+
+  it('places numeric ids before optimistic uuids', () => {
+    expect(compareMessageId(101, 'uuid-a')).toBeLessThan(0);
+    expect(compareMessageId('uuid-a', 101)).toBeGreaterThan(0);
+  });
+});
+
+describe('#compareMessages / #isNewerMessage', () => {
+  it('breaks a same-second tie on message id', () => {
+    const a = { id: 101, created_at: 1000 };
+    const b = { id: 102, created_at: 1000 };
+    expect(compareMessages(a, b)).toBeLessThan(0);
+    expect(isNewerMessage(b, a)).toBe(true);
+    expect(isNewerMessage(a, b)).toBe(false);
+  });
+
+  it('treats any message as newer than nothing', () => {
+    expect(isNewerMessage({ id: 1, created_at: 1 }, undefined)).toBe(true);
+  });
+});
+
+describe('#mergeMessagesById', () => {
+  it('orders out-of-order arrivals chronologically', () => {
+    const merged = mergeMessagesById(
+      [],
+      [
+        { id: 102, created_at: 1200 },
+        { id: 101, created_at: 1100 },
+      ]
+    );
+    expect(merged.map(m => m.id)).toEqual([101, 102]);
+  });
+
+  it('does not duplicate a repeated cable event', () => {
+    const merged = mergeMessagesById(
+      [{ id: 101, created_at: 1100, content: 'a' }],
+      [{ id: 101, created_at: 1100, content: 'a' }]
+    );
+    expect(merged).toHaveLength(1);
+  });
+
+  it('replaces a pending uuid with its server message and drops the stale identity', () => {
+    const pending = { id: 'uuid-1', echo_id: 'uuid-1', created_at: 1200 };
+    const server = { id: 500, echo_id: 'uuid-1', created_at: 1200 };
+    const merged = mergeMessagesById([pending], [server]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe(500);
+    expect(merged.some(m => m.id === 'uuid-1')).toBe(false);
+  });
+
+  it('matches an existing pending row by its echo_id', () => {
+    const pending = { id: 'uuid-9', echo_id: 'uuid-9', created_at: 10 };
+    const server = { id: 900, echo_id: 'uuid-9', created_at: 10 };
+    expect(mergeMessagesById([pending], [server])).toHaveLength(1);
+  });
+
+  it('keeps optimistic messages after server messages in insertion order', () => {
+    const merged = mergeMessagesById(
+      [],
+      [
+        { id: 'uuid-a', echo_id: 'uuid-a', created_at: 5 },
+        { id: 'uuid-b', echo_id: 'uuid-b', created_at: 1 },
+        { id: 300, created_at: 9999 },
+      ]
+    );
+    // the browser clock on the optimistic rows is not server truth, so they are not sorted
+    expect(merged.map(m => m.id)).toEqual([300, 'uuid-a', 'uuid-b']);
+  });
+
+  it('keeps only the newest `keep` messages when asked', () => {
+    const existing = [1, 2, 3, 4, 5, 6, 7].map(id => ({
+      id,
+      created_at: id,
+    }));
+    const merged = mergeMessagesById(existing, [], { keep: 5 });
+    expect(merged.map(m => m.id)).toEqual([3, 4, 5, 6, 7]);
+  });
+});
+
+describe('#mergeConversation', () => {
+  const existing = {
+    id: 1,
+    last_activity_at: 200,
+    updated_at: 200,
+    unread_count: 3,
+    messages: [{ id: 10, created_at: 100 }],
+  };
+
+  it('keeps the fresher local entity when the snapshot is older', () => {
+    const merged = mergeConversation(
+      existing,
+      { id: 1, last_activity_at: 100, updated_at: 100, unread_count: 0 },
+      { isSelected: false }
+    );
+    expect(merged.last_activity_at).toBe(200);
+    expect(merged.unread_count).toBe(3);
+  });
+
+  it('accepts a newer snapshot', () => {
+    const merged = mergeConversation(
+      existing,
+      { id: 1, last_activity_at: 300, updated_at: 300, unread_count: 9 },
+      { isSelected: false }
+    );
+    expect(merged.last_activity_at).toBe(300);
+    expect(merged.timestamp).toBe(300);
+    expect(merged.unread_count).toBe(9);
+  });
+
+  it('lets the newer updated_at win when activity is equal', () => {
+    const merged = mergeConversation(
+      existing,
+      { id: 1, last_activity_at: 200, updated_at: 500, status: 'resolved' },
+      { isSelected: false }
+    );
+    expect(merged.status).toBe('resolved');
+    expect(merged.last_activity_at).toBe(200);
+  });
+
+  it('never lets activity regress', () => {
+    const merged = mergeConversation(
+      existing,
+      { id: 1, last_activity_at: 1, updated_at: 900 },
+      { isSelected: false }
+    );
+    expect(merged.last_activity_at).toBe(200);
+  });
+
+  it('trims a non-selected row to five messages without implying completeness', () => {
+    const many = {
+      ...existing,
+      messages: [1, 2, 3, 4, 5, 6, 7].map(id => ({ id, created_at: id })),
+    };
+    const merged = mergeConversation(many, { id: 1 }, { isSelected: false });
+    expect(merged.messages).toHaveLength(5);
+    expect(merged.allMessagesLoaded).toBeUndefined();
+    expect(merged.dataFetched).toBeUndefined();
+  });
+
+  it('never trims the selected conversation', () => {
+    const many = {
+      ...existing,
+      allMessagesLoaded: true,
+      dataFetched: true,
+      messages: [1, 2, 3, 4, 5, 6, 7].map(id => ({ id, created_at: id })),
+    };
+    const merged = mergeConversation(many, { id: 1 }, { isSelected: true });
+    expect(merged.messages).toHaveLength(7);
+    expect(merged.allMessagesLoaded).toBe(true);
+    expect(merged.dataFetched).toBe(true);
   });
 });
