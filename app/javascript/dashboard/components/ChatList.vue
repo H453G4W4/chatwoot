@@ -72,7 +72,7 @@ const store = useStore();
 
 const resolveAttributesModalRef = ref(null);
 
-const activeAssigneeTab = ref(wootConstants.ASSIGNEE_TYPE.ME);
+const activeAssigneeTab = ref(wootConstants.ASSIGNEE_TYPE.ALL);
 const activeStatus = ref(wootConstants.STATUS_TYPE.OPEN);
 const activeSortBy = ref(wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC);
 const showAdvancedFilters = ref(false);
@@ -249,9 +249,9 @@ const conversationListPagination = computed(() => {
 const conversationFilters = computed(() => {
   return {
     inboxId: props.conversationInbox ? props.conversationInbox : undefined,
-    assigneeType: activeAssigneeTab.value,
+    assigneeType: wootConstants.ASSIGNEE_TYPE.ALL,
     status: activeStatus.value,
-    sortBy: activeSortBy.value,
+    sortBy: wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC,
     page: conversationListPagination.value,
     labels: props.label ? [props.label] : undefined,
     teamId: props.teamId || undefined,
@@ -353,7 +353,9 @@ const conversationList = computed(() => {
     localConversationList = sortByUnreadStatus(localConversationList);
   }
 
-  return localConversationList;
+  return [...localConversationList].sort(
+    (a, b) => (b.last_activity_at || 0) - (a.last_activity_at || 0)
+  );
 });
 
 const showEndOfListMessage = computed(() => {
@@ -380,13 +382,9 @@ const uniqueInboxes = computed(() => {
 // ---------------------- Methods -----------------------
 function setFiltersFromUISettings() {
   const { conversations_filter_by: filterBy = {} } = uiSettings.value;
-  const { status, order_by: orderBy } = filterBy;
+  const { status } = filterBy;
   activeStatus.value = status || wootConstants.STATUS_TYPE.OPEN;
-  activeSortBy.value = Object.values(wootConstants.SORT_BY_TYPE).includes(
-    orderBy
-  )
-    ? orderBy
-    : wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC;
+  activeSortBy.value = wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC;
 }
 
 function emitConversationLoaded() {
@@ -622,7 +620,7 @@ function onBasicFilterChange(value, type) {
   if (type === 'status') {
     activeStatus.value = value;
   } else {
-    activeSortBy.value = value;
+    activeSortBy.value = wootConstants.SORT_BY_TYPE.LAST_ACTIVITY_AT_DESC;
   }
   resetAndFetchData();
 }
@@ -932,7 +930,7 @@ watch(conversationFilters, (newVal, oldVal) => {
     />
 
     <ChatTypeTabs
-      v-if="!hasAppliedFiltersOrActiveFolders"
+      v-if="false"
       :items="assigneeTabItems"
       :active-tab="activeAssigneeTab"
       is-compact
