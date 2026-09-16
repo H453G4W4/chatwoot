@@ -519,6 +519,60 @@ RSpec.describe Message do
         expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
       end
 
+      it 'does not set waiting_since for an order notification matched by a subject fragment rule' do
+        rules = %([{"subject_contains":"You've got a new order:"},) +
+                %({"subject_contains_all":["order #","has been cancelled"]}])
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rules do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: order_subject } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_nil
+      end
+
+      it 'does not set waiting_since for a cancelled order matched by a subject_contains_all rule' do
+        rules = %([{"subject_contains":"You've got a new order:"},) +
+                %({"subject_contains_all":["order #","has been cancelled"]}])
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rules do
+          create(:message, account: account, conversation: email_conversation, sender: contact,
+                           message_type: :incoming, content_type: :incoming_email,
+                           content_attributes: { email: { subject: 'Order #12252 has been cancelled' } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_nil
+      end
+
+      it 'sets waiting_since for a contact form message under the shipped rules' do
+        rules = %([{"subject_contains":"You've got a new order:"},) +
+                %({"subject_contains_all":["order #","has been cancelled"]}])
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rules do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: 'Contact form: I need help' } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
+      it 'sets waiting_since for a customer message carrying only the cancellation fragment' do
+        rules = %([{"subject_contains":"You've got a new order:"},) +
+                %({"subject_contains_all":["order #","has been cancelled"]}])
+        message = nil
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: rules do
+          message = create(:message, account: account, conversation: email_conversation, sender: contact,
+                                     message_type: :incoming, content_type: :incoming_email,
+                                     content_attributes: { email: { subject: 'my subscription has been cancelled, please help' } })
+        end
+
+        expect(email_conversation.reload.waiting_since).to be_within(1.second).of(message.created_at)
+      end
+
       it 'does not clear a waiting_since that is already present' do
         original_waiting_since = 2.hours.ago
         email_conversation.update!(waiting_since: original_waiting_since)

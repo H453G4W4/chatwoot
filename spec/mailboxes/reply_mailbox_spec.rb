@@ -735,6 +735,13 @@ RSpec.describe ReplyMailbox do
     let(:order_subject) { "[Evestv #1 The Best IPTV Subscription]: You've got a new order: #12252" }
     let(:order_rule) { %([{"from":"admin@evestv.com","subject_contains":"You've got a new order:"}]) }
 
+    # The configuration we ship. A subject-only rule needs no sender, so it still fires when
+    # WooCommerce puts the buyer in Reply-To and Chatwoot attributes the mail to that contact.
+    let(:production_rules) do
+      %([{"subject_contains":"You've got a new order:"},) +
+        %({"subject_contains_all":["order #","has been cancelled"]}])
+    end
+
     it 'opens the conversation without waiting_since for a matching order notification' do
       inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
                                                      subject: order_subject, body: 'Order #12252 has been placed.')
@@ -756,6 +763,56 @@ RSpec.describe ReplyMailbox do
                                                      body: 'My subscription stopped working.')
 
       with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      expect(Conversation.last.waiting_since).not_to be_nil
+    end
+
+    it 'opens the conversation without waiting_since for a subject fragment new order rule' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     reply_to: 'buyer@example.com', subject: order_subject,
+                                                     body: 'Order #12252 has been placed.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      conversation = Conversation.last
+      expect(conversation.contact.email).to eq('buyer@example.com')
+      expect(conversation.waiting_since).to be_nil
+    end
+
+    it 'opens the conversation without waiting_since for a subject_contains_all cancelled order rule' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     subject: '[Evestv]: Order #12252 has been cancelled',
+                                                     body: 'Order #12252 has been cancelled.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      expect(Conversation.last.waiting_since).to be_nil
+    end
+
+    it 'opens the conversation with waiting_since for a customer cancellation request' do
+      inbound_email = create_inbound_email_from_mail(from: 'customer@example.com', to: channel_email.email,
+                                                     subject: 'my subscription has been cancelled, please help',
+                                                     body: 'I did not ask for this.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+        expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
+      end
+
+      expect(Conversation.last.waiting_since).not_to be_nil
+    end
+
+    it 'opens the conversation with waiting_since for a contact form email under the shipped rules' do
+      inbound_email = create_inbound_email_from_mail(from: 'admin@evestv.com', to: channel_email.email,
+                                                     subject: 'Contact form: I need help with my subscription',
+                                                     body: 'My subscription stopped working.')
+
+      with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
         expect { described_class.receive inbound_email }.to change(Conversation, :count).by(1)
       end
 

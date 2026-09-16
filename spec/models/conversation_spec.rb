@@ -171,6 +171,75 @@ RSpec.describe Conversation do
       end
     end
 
+    context 'with the shipped exclusion rules' do
+      # No sender, so Reply-To rewriting cannot defeat them; the cancellation rule needs two
+      # fragments so a customer writing "has been cancelled" is not swallowed.
+      let(:production_rules) do
+        %([{"subject_contains":"You've got a new order:"},) +
+          %({"subject_contains_all":["order #","has been cancelled"]}])
+      end
+
+      it 'does not stamp waiting_since for a new order notification' do
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+          conversation = create(:conversation, account: account, inbox: email_inbox, contact: contact,
+                                               additional_attributes: email_attributes)
+
+          expect(conversation.reload.waiting_since).to be_nil
+        end
+      end
+
+      it 'does not stamp waiting_since for a cancelled order notification' do
+        cancelled_subject = '[Evestv #1 The Best IPTV Subscription]: Order #12252 has been cancelled'
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+          conversation = create(:conversation, account: account, inbox: email_inbox, contact: contact,
+                                               additional_attributes: email_attributes.merge('mail_subject' => cancelled_subject))
+
+          expect(conversation.reload.waiting_since).to be_nil
+        end
+      end
+
+      it 'does not stamp waiting_since whoever the sender turns out to be' do
+        other_contact = create(:contact, account: account, email: 'buyer@example.com')
+
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+          conversation = create(:conversation, account: account, inbox: email_inbox, contact: other_contact,
+                                               additional_attributes: email_attributes)
+
+          expect(conversation.reload.waiting_since).to be_nil
+        end
+      end
+
+      it 'stamps waiting_since for a customer email carrying only the cancellation fragment' do
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+          conversation = create(:conversation, account: account, inbox: email_inbox, contact: contact,
+                                               additional_attributes: email_attributes.merge(
+                                                 'mail_subject' => 'my subscription has been cancelled, please help'
+                                               ))
+
+          expect(conversation.reload.waiting_since).not_to be_nil
+        end
+      end
+
+      it 'stamps waiting_since for a contact form email' do
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: production_rules do
+          conversation = create(:conversation, account: account, inbox: email_inbox, contact: contact,
+                                               additional_attributes: email_attributes.merge('mail_subject' => 'Contact form: I need help'))
+
+          expect(conversation.reload.waiting_since).not_to be_nil
+        end
+      end
+
+      it 'stamps waiting_since when the rule configures a sender and no subject' do
+        with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: %([{"from":"admin@evestv.com"}]) do
+          conversation = create(:conversation, account: account, inbox: email_inbox, contact: contact,
+                                               additional_attributes: email_attributes)
+
+          expect(conversation.reload.waiting_since).not_to be_nil
+        end
+      end
+    end
+
     it 'does not clear waiting_since when a matching notification lands on a waiting conversation' do
       with_modified_env NEEDS_REPLY_EXCLUDED_EMAIL_RULES: order_rule do
         conversation = create(:conversation, account: account, inbox: email_inbox, contact: contact,
